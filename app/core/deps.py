@@ -6,21 +6,14 @@ from fastapi import Cookie, Depends, status
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.errors import ApiError
-from app.core.time import utcnow
 from app.db.session import get_db
-from app.models import Session as SessionRow
 from app.models import User
+from app.repositories import sessions as sessions_repo
+from app.repositories import users as users_repo
 
 SESSION_COOKIE = "session"
 
 DbDep = Annotated[OrmSession, Depends(get_db)]
-
-
-def _load_session(db: OrmSession, token: str) -> SessionRow | None:
-    row = db.get(SessionRow, token)
-    if row is None or row.expires_at <= utcnow():
-        return None
-    return row
 
 
 def get_current_user(
@@ -29,18 +22,19 @@ def get_current_user(
 ) -> User:
     if not session_cookie:
         raise ApiError("unauthorized", "Not authenticated", status_code=status.HTTP_401_UNAUTHORIZED)
-    session = _load_session(db, session_cookie)
+    session = sessions_repo.get_active(db, session_cookie)
     if session is None:
         raise ApiError("unauthorized", "Session expired", status_code=status.HTTP_401_UNAUTHORIZED)
 
-    user = db.get(User, session.user_id)
+    user = users_repo.get(db, session.user_id)
     if user is None:
         raise ApiError("unauthorized", "User not found", status_code=status.HTTP_401_UNAUTHORIZED)
     if user.is_suspended:
-        raise ApiError("account_suspended", "Account is suspended", status_code=status.HTTP_403_FORBIDDEN)
+        raise ApiError(
+            "account_suspended", "Account is suspended", status_code=status.HTTP_403_FORBIDDEN
+        )
 
-    session.last_used_at = utcnow()
-    db.add(session)
+    sessions_repo.touch(db, session)
     db.commit()
     return user
 
