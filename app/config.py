@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    APP_ENV: Literal["development", "production", "test"] = "development"
+
+    DATABASE_URL: str = "sqlite:///./db/outreach.db"
+    DB_ECHO: bool = False
+
+    FRONTEND_ORIGIN: str = "http://localhost:3000"
+    ALLOWED_ORIGINS: str = "http://localhost:3000"
+
+    COOKIE_DOMAIN: str = ""
+    COOKIE_SECURE: bool = False
+    COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
+
+    TOKEN_ENCRYPTION_KEY: str = ""
+
+    HUNTER_API_KEY: str = ""
+
+    TIMEZONE: str = "Asia/Kolkata"
+    SEND_HOURS_START: int = 9
+    SEND_HOURS_END: int = 19
+    DEFAULT_DAILY_LIMIT: int = 20
+    HARD_DAILY_CEILING: int = 30
+    GLOBAL_LOCK_DAYS: int = 2
+    FOLLOWUP_DELAY_DAYS: int = 4
+    MAX_FOLLOWUPS: int = 2
+    SESSION_TTL_DAYS: int = 30
+
+    LOG_LEVEL: str = "INFO"
+    RUN_SCHEDULER: bool = False
+    ADMIN_EMAILS: str = ""
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def admin_emails_set(self) -> set[str]:
+        return {e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()}
+
+    @property
+    def is_prod(self) -> bool:
+        return self.APP_ENV == "production"
+
+    @field_validator("DEFAULT_DAILY_LIMIT", "HARD_DAILY_CEILING")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be positive")
+        return v
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
