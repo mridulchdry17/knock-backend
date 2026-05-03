@@ -179,6 +179,23 @@ Decided that when OAuth ships, we'll do a "soft gate": OAuth callback creates th
 **2026-05-03 — Email volume sanity check.**
 At PRD's 100-user verification cap and a year of activity, projected DB size is ~590 MB — well under Turso's 9 GB free tier. The actual ceiling is SQLite's single-writer concurrency (PRD §5), not Turso's storage. Migration to Postgres (Neon) is a planned step at ~50 concurrent users. Nothing to do now.
 
+**2026-05-03 — OAuth auth model: switch from cookies to bearer tokens (decision pending).**
+Re-examined the cookie-based session model when user pointed out we don't have a domain. The PRD's design uses an HTTP-only `session` cookie set on the backend domain, scoped to a parent domain (`Domain=.knock.app`) so both `app.knock.app` (frontend) and `api.knock.app` (backend) receive it. **This requires a domain we own** — `*.vercel.app` and `*.cloudapp.azure.com` can't share cookies because (a) we don't own the parent and (b) both are on the Public Suffix List, which browsers explicitly forbid setting `Domain=` cookies on. DuckDNS has the same PSL problem.
+
+User's lean: **switch to bearer tokens** so we never need a domain. Plan when OAuth phase begins:
+- Backend issues an opaque session token (or signed JWT) at the end of OAuth callback, returns it in JSON response body instead of `Set-Cookie`.
+- Frontend stores it (in `localStorage` or, better, in a closure/in-memory + `sessionStorage` for less XSS surface).
+- Frontend sends it on every API call as `Authorization: Bearer <token>`.
+- `app/core/deps.py::get_current_user` reads from `Authorization` header instead of `Cookie`.
+- The `sessions` table stays — it's still the source of truth, just keyed by the bearer token instead of a cookie value.
+- Drop the CSRF middleware entirely (no cookies = no CSRF). The `X-Requested-With` requirement on `/api/v1/*` becomes unnecessary; we'd remove it.
+- Logout = delete the session row (same as today) + frontend wipes its stored token.
+- Backend changes affected: `app/routers/auth.py` (callback returns JSON not redirect, or redirects with token in URL fragment), `app/core/deps.py` (read header), `app/core/csrf.py` (delete or no-op), `app/core/cookies.py` (delete or shrink). Frontend gains a small token-store module + Authorization-header injection in its API client.
+
+**Risks acknowledged:** bearer-in-localStorage is XSS-vulnerable (any JS injection grabs the token); can't be `httpOnly`; harder to invalidate centrally (we still have the sessions table so it's revocable, just slower than cookie-clearing). Mitigations: strict CSP, rotate tokens on refresh, short TTL with refresh tokens. We accept this trade as the cost of not buying a domain.
+
+**Open until OAuth phase begins.** Until then nothing changes — the waitlist endpoint doesn't authenticate, so cookies/bearer doesn't matter.
+
 ---
 
 ## What's next (in order)
@@ -191,8 +208,9 @@ At PRD's 100-user verification cap and a year of activity, projected DB size is 
 6. **Cut release**: merge `feat/waitlist-and-turso` to backend `main`, merge frontend to `main`. Open dev branch for OAuth/campaigns.
 
 Stretch (after waitlist is live):
-- Buy domain (~$8/year) → switch backend to `api.knock.<tld>` → start OAuth work on backend dev branch.
-- Add TLS to backend with Caddy + Let's Encrypt (uses the Azure DNS label or the new domain).
+- **Switch auth model from cookies → bearer tokens** *before* implementing real OAuth (see 2026-05-03 OAuth log entry). Touches `app/routers/auth.py`, `app/core/deps.py`, `app/core/csrf.py`, `app/core/cookies.py`, and the frontend API client. Roughly 1 day. Lets us skip buying a domain.
+- ~~Buy domain (~$8/year)~~ → no longer needed if bearer-token plan holds. Revisit only if we change our minds about XSS risk on localStorage.
+- Add TLS to backend with Caddy + Let's Encrypt (uses the Azure DNS label `knock-api.koreacentral.cloudapp.azure.com` — works without a custom domain).
 - Write the soft-gate logic on the OAuth callback.
 - Pull the waitlist CSV when ready to email the launch announcement (use Knock itself once OAuth is live — eat the dog food).
 
