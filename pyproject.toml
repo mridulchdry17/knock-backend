@@ -13,6 +13,7 @@ dependencies = [
   "pydantic>=2.7",
   "pydantic-settings>=2.4",
   "sqlalchemy>=2.0",
+  "sqlalchemy-libsql>=0.1.0",
   "alembic>=1.13",
   "apscheduler>=3.10",
   "google-auth>=2.30",
