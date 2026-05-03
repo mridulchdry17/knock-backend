@@ -10,6 +10,81 @@
 
 ---
 
+## 0. Implementation Status (live tracker)
+
+**Last updated:** 2026-05-03 — after Phase 1 (Google OAuth + sessions) merged to feature branch.
+**Frontend repo contract:** see [FRONTEND.md](FRONTEND.md).
+
+### Legend
+- ✅ **Done** — implemented, live-tested, on a feature branch.
+- 🟡 **Partial** — module exists, some sub-features still missing.
+- ⬜ **Not started** — scoped, not yet built.
+- 🚫 **Out of MVP** — deferred to post-MVP.
+
+### Phase tracker
+
+| Phase | Scope | Status | Branch |
+|---|---|---|---|
+| Phase 0 | Project foundation, schema, Alembic, health API | ✅ Done | `feat/foundation-and-schema` |
+| Phase 1 | Google OAuth + sessions + auth API | ✅ Done | `feat/google-oauth-and-sessions` |
+| Phase 2 | Onboarding + Gmail send (test endpoint) | ⬜ Next | — |
+| Phase 3 | Templates CRUD + render preview | ⬜ | — |
+| Phase 4 | Scrapers + companies + contact discovery | ⬜ | — |
+| Phase 5 | Campaigns + send queue + send worker | ⬜ | — |
+| Phase 6 | Reply + bounce detection (Gmail polling) | ⬜ | — |
+| Phase 7 | Follow-up engine | ⬜ | — |
+| Phase 8 | Admin endpoints + dashboard summary | ⬜ | — |
+| Phase 9 | Tests (moat invariant, pipeline, scope check) | 🟡 (none yet) | — |
+
+### Per-section status (mapped to PRD numbering)
+
+| § | Section | Status | Notes |
+|---|---|---|---|
+| 1 | Product overview | ✅ design | — |
+| 2 | Goals & non-goals | ✅ design | — |
+| 3 | Personas & flows | ✅ design | — |
+| 4 | Architecture | ✅ design | Diagram + principles match implementation |
+| 5 | Tech stack | ✅ done | All listed deps installed |
+| 6.1 | Google OAuth + Gmail API | 🟡 partial | OAuth ✅; Gmail send/read ⬜ (Phase 2/6) |
+| 6.2 | RSS feeds | ⬜ | Phase 4 |
+| 6.3 | Hunter.io stub | ⬜ | Phase 4 |
+| 7 | DB schema | ✅ done | All 10 tables created via `0001_init` migration |
+| 8 | Google OAuth integration spec | ✅ done | `services/google_oauth.py` + token encryption |
+| 9 | Send pipeline | ⬜ | Phase 5 |
+| 10 | Reply / bounce / unsubscribe detection | ⬜ | Phase 6 |
+| 11 | Follow-up engine | ⬜ | Phase 7 |
+| 12 | Company ingestion (scrapers) | ⬜ | Phase 4 |
+| 13 | Contact / email discovery | ⬜ | Phase 4 |
+| 14 | API spec | 🟡 partial | Auth + health live; rest stubbed in spec |
+| 15 | Frontend contract | ✅ done | See FRONTEND.md |
+| 16 | Auth & sessions | ✅ done | Cookie + server-side sessions + CSRF guard live |
+| 17 | Background jobs | ⬜ | Phase 5 (scheduler bootstrap) |
+| 18 | Configuration | ✅ done | Pydantic-settings; `.env.example` ships |
+| 19 | Project structure | ✅ done | Matches spec + `repositories/` added |
+| 20 | Setup instructions | ✅ done | Dev path verified end-to-end |
+| 21 | Testing strategy | 🟡 strategy doc only | Phase 9 |
+| 22 | Compliance | 🟡 partial | Footer template doc'd; render path is Phase 5 |
+| 23 | Roadmap | ✅ design | — |
+| 24 | Risks | ✅ design | — |
+| 25 | Cost model | ✅ design | — |
+| 26 | Future scope | ✅ design | — |
+
+### Endpoints currently live
+
+| Method | Path | Status |
+|---|---|---|
+| GET | `/healthz` | ✅ |
+| GET | `/readyz` | ✅ |
+| GET | `/auth/login` | ✅ |
+| GET | `/auth/google/callback` | ✅ |
+| GET | `/api/v1/auth/me` | ✅ |
+| POST | `/api/v1/auth/logout` | ✅ |
+| POST | `/api/v1/auth/disconnect` | ✅ |
+
+Everything else in §14 is **planned** — see the per-phase tracker above.
+
+---
+
 ## 1. Product Overview
 
 ### 1.1 One-line description
