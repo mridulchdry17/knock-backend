@@ -227,6 +227,7 @@ Stretch (after waitlist is live):
 - **Alembic builds its own engine.** Initial implementation of `alembic/env.py` did `engine_from_config(...)` which bypassed our `_build_engine()` and dropped the `auth_token` connect_arg. Fixed by importing and reusing `engine` from `app.db.base`.
 - **Vercel `NEXT_PUBLIC_*` vars are baked into the client JS bundle.** Used to leak the backend URL. Fixed by switching to the proxy with a server-only `BACKEND_URL`. Verified via grep across `_next/static/chunks/*.js`.
 - **Azure VMs block ICMP by default.** `ping <hostname>` fails even when the host is up. Don't use ping to check liveness — use `curl :22` for SSH or `curl :8000/healthz` for the backend.
+- **`isolation_level="AUTOCOMMIT"` doesn't auto-commit ad-hoc `engine.connect().execute(...)` on libsql.** Despite the engine option, raw DML through `engine.connect()` silently rolls back when the connection closes — the row appears deleted in that connection's view but the change never reaches Turso. **Workaround:** use `with engine.begin() as c:` for any ad-hoc DML from the shell — this opens an explicit transaction and commits on context-manager exit. The app's normal request flow is unaffected because `app/routers/*` use the SQLAlchemy `Session` and call `db.commit()` explicitly, which works correctly.
 
 ---
 
