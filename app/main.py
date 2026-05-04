@@ -6,7 +6,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.core.csrf import CSRFHeaderMiddleware
 from app.core.errors import register_error_handlers
 from app.logging import configure_logging, get_logger
 from app.routers import register as register_routers
@@ -34,11 +33,10 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins_list,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+        allow_headers=["Authorization", "Content-Type"],
     )
-    app.add_middleware(CSRFHeaderMiddleware)
 
     register_error_handlers(app)
     register_routers(app)

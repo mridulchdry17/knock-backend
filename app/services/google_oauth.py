@@ -134,14 +134,14 @@ def exchange_code(code: str, state: str, redirect_uri: str) -> GoogleIdentity:
 def revoke_refresh_token(refresh_token: str) -> None:
     """Best-effort revoke at Google's revoke endpoint. Failures are swallowed —
     we always clear our local copy regardless."""
+    import contextlib
+
     import httpx
 
-    try:
+    with contextlib.suppress(httpx.HTTPError):
         httpx.post(
             "https://oauth2.googleapis.com/revoke",
             data={"token": refresh_token},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=5.0,
         )
-    except httpx.HTTPError:
-        pass

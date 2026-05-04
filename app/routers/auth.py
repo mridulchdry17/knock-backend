@@ -4,31 +4,34 @@ Two flavours of route under different mount points:
 
   * Browser-redirect bootstrap (cannot send custom headers):
       GET  /auth/login              → 302 to Google
-      GET  /auth/google/callback    → finalize, set cookie, 302 to frontend
+      GET  /auth/google/callback    → finalize, 302 to frontend with token in URL fragment
 
-  * JSON API (require X-Requested-With + valid session cookie):
+  * JSON API (require `Authorization: Bearer <token>`):
       POST /api/v1/auth/logout
       POST /api/v1/auth/disconnect
       GET  /api/v1/auth/me
+
+Session transport is the bearer token (raw `sessions.id`). The token is delivered
+to the frontend via URL fragment (`#token=...`) on the OAuth callback redirect —
+fragments never reach the server, so they don't appear in access logs or referer
+headers. The frontend stores the token in `sessionStorage` and attaches it as
+`Authorization: Bearer <token>` on every API call.
 """
 from __future__ import annotations
 
-from datetime import timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
-from fastapi import APIRouter, Cookie, Query, Request, Response, status
+from fastapi import APIRouter, Cookie, Query, Request, status
 from fastapi.responses import RedirectResponse
 
 from app.config import settings
 from app.core.cookies import (
     OAUTH_STATE_COOKIE,
     clear_oauth_state_cookie,
-    clear_session_cookie,
     set_oauth_state_cookie,
-    set_session_cookie,
 )
 from app.core.crypto import decrypt_optional
-from app.core.deps import SESSION_COOKIE, CurrentUser, DbDep
+from app.core.deps import CurrentSessionToken, CurrentUser, DbDep
 from app.repositories import sessions as sessions_repo
 from app.schemas.auth import MeOut
 from app.schemas.common import Ok
@@ -48,6 +51,21 @@ def _frontend_redirect(path: str, **params: str) -> RedirectResponse:
     base = settings.FRONTEND_ORIGIN.rstrip("/") + path
     if params:
         base = f"{base}?{urlencode(params)}"
+    return RedirectResponse(url=base, status_code=status.HTTP_302_FOUND)
+
+
+def _frontend_redirect_with_token(path: str, token: str, **params: str) -> RedirectResponse:
+    """Redirect to frontend with the session token in the URL fragment.
+
+    The fragment is browser-only — it never reaches the backend, doesn't appear
+    in access logs, and is stripped from `Referer` headers. Frontend's
+    `/auth/complete` page reads the fragment, stores the token, and clears the
+    URL via `history.replaceState`.
+    """
+    base = settings.FRONTEND_ORIGIN.rstrip("/") + path
+    if params:
+        base = f"{base}?{urlencode(params)}"
+    base = f"{base}#token={quote(token, safe='')}"
     return RedirectResponse(url=base, status_code=status.HTTP_302_FOUND)
 
 
@@ -91,13 +109,8 @@ def google_callback(
         ip=request.client.host if request.client else None,
     )
 
-    redirect_to = "/onboarding" if not user.is_onboarded else "/dashboard"
-    resp = _frontend_redirect(redirect_to)
-    set_session_cookie(
-        resp,
-        session.id,
-        max_age_seconds=int(timedelta(days=settings.SESSION_TTL_DAYS).total_seconds()),
-    )
+    next_path = "/onboarding" if not user.is_onboarded else "/dashboard"
+    resp = _frontend_redirect_with_token("/auth/complete", session.id, next=next_path)
     clear_oauth_state_cookie(resp)
     return resp
 
@@ -120,20 +133,14 @@ def me(user: CurrentUser) -> MeOut:
 
 
 @api.post("/logout", response_model=Ok)
-def logout(
-    db: DbDep,
-    response: Response,
-    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
-) -> Ok:
-    if session_cookie:
-        sessions_repo.delete_by_id(db, session_cookie)
-        db.commit()
-    clear_session_cookie(response)
+def logout(db: DbDep, token: CurrentSessionToken) -> Ok:
+    sessions_repo.delete_by_id(db, token)
+    db.commit()
     return Ok()
 
 
 @api.post("/disconnect", response_model=Ok)
-def disconnect(user: CurrentUser, db: DbDep, response: Response) -> Ok:
+def disconnect(user: CurrentUser, db: DbDep) -> Ok:
     refresh_token = decrypt_optional(user.google_refresh_token)
     if refresh_token:
         revoke_refresh_token(refresh_token)
@@ -147,5 +154,4 @@ def disconnect(user: CurrentUser, db: DbDep, response: Response) -> Ok:
 
     sessions_repo.delete_by_user(db, user.id)
     db.commit()
-    clear_session_cookie(response)
     return Ok()

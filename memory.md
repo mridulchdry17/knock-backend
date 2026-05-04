@@ -6,19 +6,21 @@
 
 ---
 
-## Status snapshot (last updated: 2026-05-03)
+## Status snapshot (last updated: 2026-05-05)
 
 | Area | Status |
 |---|---|
-| Frontend repo | Live at `github.com/mridulchdry17/knock-frontend`, branch `main`. Not yet connected to Vercel. |
-| Frontend UI | Single landing page with email-only waitlist form. No other pages yet. |
+| Frontend repo | Live at `github.com/mridulchdry17/knock-frontend`, deployed on Vercel. |
+| Frontend UI | Single landing page with email-only waitlist form. |
 | Frontend → Backend wiring | Same-origin Next.js proxy at `/api/waitlist` → `${BACKEND_URL}/api/v1/waitlist`. Backend hostname kept out of the browser bundle. |
-| Backend repo | Live at `github.com/mridulchdry17/knock-backend`. Active dev branch: `feat/waitlist-and-turso` (waitlist endpoint + Turso support). Earlier branches: `docs/progress-and-frontend-spec`, `feat/google-oauth-and-sessions`, `feat/foundation-and-schema`. |
-| Backend deployment | **Not yet deployed.** VM provisioned but uvicorn not running. |
-| Database | Turso (libSQL) — `knock-mridulchdry17.aws-ap-south-1.turso.io`. Schema migrated (10 tables incl. `waitlist`, all empty in prod). 2 dev test rows present. |
-| Infra — Azure VM | Provisioned, public IP `40.82.143.50`, DNS label `knock-api.koreacentral.cloudapp.azure.com`. NSG port 8000 status unverified by user. Backend not running on it yet. |
-| Infra — Vercel | Frontend not yet imported. Will set env var `BACKEND_URL` once VM is live. |
-| OAuth / Gmail / sending | Not started. PRD Phase 2+ work — deferred until waitlist is live. |
+| Backend repo | Live at `github.com/mridulchdry17/knock-backend`. Active dev branch: `feat/auth-bearer-tokens`. Waitlist + Turso work merged to `main`. |
+| Backend deployment | **Live** on Azure VM at `http://knock-api.koreacentral.cloudapp.azure.com:8000`. systemd unit running. HTTP only — TLS planned (Phase 3, Caddy + Let's Encrypt). |
+| Database | Turso (libSQL) — `knock-mridulchdry17.aws-ap-south-1.turso.io`. Schema migrated (10 tables incl. `waitlist`). Real signups landing in production. |
+| Auth model | **Bearer tokens**, not cookies (Phase 2, branch `feat/auth-bearer-tokens`). Session token = raw `sessions.id`, transported via `Authorization: Bearer <token>`. OAuth callback redirects to `${FRONTEND_ORIGIN}/auth/complete?next=...#token=...` — fragment never reaches the server. CSRF middleware deleted (no cookies = no CSRF). `oauth_state` cookie remains for the OAuth round-trip (same-origin, backend-only). Frontend changes live in knock-frontend repo. |
+| Three user tiers | Planned: `free` / `paid` / `super_admin`. Schema column + tier-gating dependencies arrive in Phase 4 (not yet built). Existing `users.is_admin` boolean unchanged for now. |
+| Billing | **Deferred to v3.** No Stripe in v1/v2. Tier transitions are manual via super_admin endpoints once Phase 4 ships. |
+| Infra — Azure VM | Public IP `40.82.143.50`, DNS label `knock-api.koreacentral.cloudapp.azure.com`. NSG 8000 open. |
+| OAuth / Gmail / sending | OAuth routes wired, unused in production. Real OAuth UX + Gmail send pipeline = Phase 5. |
 
 ---
 
@@ -198,6 +200,20 @@ User's lean: **switch to bearer tokens** so we never need a domain. Plan when OA
 **Risks acknowledged:** bearer-in-localStorage is XSS-vulnerable (any JS injection grabs the token); can't be `httpOnly`; harder to invalidate centrally (we still have the sessions table so it's revocable, just slower than cookie-clearing). Mitigations: strict CSP, rotate tokens on refresh, short TTL with refresh tokens. We accept this trade as the cost of not buying a domain.
 
 **Open until OAuth phase begins.** Until then nothing changes — the waitlist endpoint doesn't authenticate, so cookies/bearer doesn't matter.
+
+**2026-05-05 — Bearer-token swap implemented (branch `feat/auth-bearer-tokens`).**
+Phase 2 from the roadmap. Concrete changes:
+- `app/core/deps.py` — `get_current_user` now reads `Authorization: Bearer <token>` via FastAPI's `HTTPBearer` security scheme. New dep `CurrentSessionToken` exposes the raw token to logout/disconnect. Bearer token IS the `sessions.id` (no hashing change in this PR; matches existing scheme).
+- `app/core/cookies.py` — dropped `set_session_cookie`/`clear_session_cookie`/`SESSION_COOKIE`. Kept `oauth_state` helpers — that cookie is same-origin (backend domain only) and required to bind the OAuth round-trip.
+- `app/core/csrf.py` — **deleted**. No cookies = no CSRF surface.
+- `app/main.py` — removed `CSRFHeaderMiddleware`. CORS dropped `X-Requested-With` from allow-headers, flipped `allow_credentials=False` (correct now that we're not sending cookies cross-origin).
+- `app/routers/auth.py` — `/auth/google/callback` redirects to `${FRONTEND_ORIGIN}/auth/complete?next=<onboarding|dashboard>#token=<session.id>`. Fragment is browser-only, never reaches the server, doesn't appear in access logs or `Referer` headers. Logout/disconnect take `CurrentSessionToken` instead of `Cookie(SESSION_COOKIE)`.
+- `.github/workflows/ci.yml` — first CI workflow: ruff check + import smoke + `alembic upgrade head` against ephemeral SQLite. Pytest step is conditional (skips if no `tests/test_*.py`). Required before merge.
+- Pre-existing lint errors fixed (unused imports, sorted `__all__`, `contextlib.suppress` rewrite). Ruff now clean.
+
+Tier-gating helpers (`require_tier`, `require_super_admin`, `require_paid`) **deferred to Phase 4** PR — they need `users.tier` column which doesn't exist yet. Adding them now would be dead code referencing a missing attribute.
+
+Frontend changes (token store in sessionStorage, `Authorization` header injection, `/auth/complete` route) live in the knock-frontend repo — separate PR.
 
 ---
 
