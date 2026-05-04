@@ -102,15 +102,14 @@ def google_callback(
         clear_oauth_state_cookie(resp)
         return resp
 
-    user, session = auth_service.complete_google_login(
+    _user, session, decision = auth_service.complete_google_login(
         db,
         identity,
         user_agent=request.headers.get("user-agent"),
         ip=request.client.host if request.client else None,
     )
 
-    next_path = "/onboarding" if not user.is_onboarded else "/dashboard"
-    resp = _frontend_redirect_with_token("/auth/complete", session.id, next=next_path)
+    resp = _frontend_redirect_with_token("/auth/complete", session.id, next=decision.next_path)
     clear_oauth_state_cookie(resp)
     return resp
 
@@ -124,7 +123,7 @@ def me(user: CurrentUser) -> MeOut:
         id=user.id,
         email=user.email,
         full_name=user.full_name,
-        is_admin=user.is_admin,
+        tier=user.tier,
         onboarded=user.is_onboarded,
         has_gmail_connected=user.has_gmail_connected,
         daily_limit=user.daily_limit,

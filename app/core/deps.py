@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated
 
 from fastapi import Depends, status
@@ -70,10 +71,39 @@ def get_current_user(
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def require_admin(user: CurrentUser) -> User:
-    if not user.is_admin:
-        raise ApiError("forbidden", "Admin only", status_code=status.HTTP_403_FORBIDDEN)
-    return user
+# ─────────────────────────── tier gating ───────────────────────────
 
 
-AdminUser = Annotated[User, Depends(require_admin)]
+def require_tier(*allowed: str) -> Callable[[User], User]:
+    """Factory: returns a dependency that 403s if `current_user.tier` not in allowed.
+
+    Usage:
+        @router.post("/foo", dependencies=[Depends(require_tier("free", "paid"))])
+        ...
+
+    Or for an annotated alias:
+        require_paid = require_tier("paid", "super_admin")
+
+    The 'pending' tier is intentionally never in any allowed list — pending
+    users see 403 on every feature route until super_admin approves them.
+    """
+    allowed_set = frozenset(allowed)
+
+    def dep(user: CurrentUser) -> User:
+        if user.tier not in allowed_set:
+            raise ApiError(
+                "forbidden",
+                f"This action requires tier in {sorted(allowed_set)}; your tier is '{user.tier}'.",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        return user
+
+    return dep
+
+
+# Common tier gates. Add new ones only when a route actually needs them.
+require_super_admin = require_tier("super_admin")
+require_paid = require_tier("paid", "super_admin")  # super_admin inherits paid access
+
+SuperAdminUser = Annotated[User, Depends(require_super_admin)]
+PaidUser = Annotated[User, Depends(require_paid)]
