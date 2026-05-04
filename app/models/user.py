@@ -37,6 +37,12 @@ class User(Base, TimestampMixin):
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_suspended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Phase 4 — soft-gate + tier model. See memory.md log entries 2026-05-05.
+    # `is_admin` is being phased out; reads should prefer `tier == 'super_admin'`.
+    waitlist_email: Mapped[str | None] = mapped_column(String(255), unique=True)
+    tier: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    tier_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     @property
     def has_gmail_connected(self) -> bool:
         return bool(self.google_refresh_token)
