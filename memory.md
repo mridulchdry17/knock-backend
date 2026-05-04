@@ -14,12 +14,13 @@
 | Frontend UI | Single landing page with email-only waitlist form. |
 | Frontend → Backend wiring | Same-origin Next.js proxy at `/api/waitlist` → `${BACKEND_URL}/api/v1/waitlist`. Backend hostname kept out of the browser bundle. |
 | Backend repo | Live at `github.com/mridulchdry17/knock-backend`. Active dev branch: `feat/auth-bearer-tokens`. Waitlist + Turso work merged to `main`. |
-| Backend deployment | **Live** on Azure VM at `http://knock-api.koreacentral.cloudapp.azure.com:8000`. systemd unit running. HTTP only — TLS planned (Phase 3, Caddy + Let's Encrypt). |
+| Backend deployment | **Live** on Azure VM at `https://knock-api.koreacentral.cloudapp.azure.com` via Caddy + Let's Encrypt (Phase 3 done 2026-05-05). uvicorn running manually from a terminal session (not yet under systemd — see "deferred" below). |
 | Database | Turso (libSQL) — `knock-mridulchdry17.aws-ap-south-1.turso.io`. Schema migrated (10 tables incl. `waitlist`). Real signups landing in production. |
 | Auth model | **Bearer tokens**, not cookies (Phase 2, branch `feat/auth-bearer-tokens`). Session token = raw `sessions.id`, transported via `Authorization: Bearer <token>`. OAuth callback redirects to `${FRONTEND_ORIGIN}/auth/complete?next=...#token=...` — fragment never reaches the server. CSRF middleware deleted (no cookies = no CSRF). `oauth_state` cookie remains for the OAuth round-trip (same-origin, backend-only). Frontend changes live in knock-frontend repo. |
 | Three user tiers | Planned: `free` / `paid` / `super_admin`. Schema column + tier-gating dependencies arrive in Phase 4 (not yet built). Existing `users.is_admin` boolean unchanged for now. |
 | Billing | **Deferred to v3.** No Stripe in v1/v2. Tier transitions are manual via super_admin endpoints once Phase 4 ships. |
-| Infra — Azure VM | Public IP `40.82.143.50`, DNS label `knock-api.koreacentral.cloudapp.azure.com`. NSG 8000 open. |
+| Infra — Azure VM | Public IP `40.82.143.50`, DNS label `knock-api.koreacentral.cloudapp.azure.com`. NSG inbound 80 + 443 open. **NSG 8000 also still open** (deliberately deferred — must close before Phase 4 OAuth ships). |
+| Caddy | Installed via Cloudsmith repo, `/etc/caddy/Caddyfile` reverse-proxies `knock-api.koreacentral.cloudapp.azure.com` → `localhost:8000`. LE cert auto-provisioned via HTTP-01 challenge, auto-renews every ~60 days. HTTP→HTTPS 308 redirect handled automatically by Caddy. |
 | OAuth / Gmail / sending | OAuth routes wired, unused in production. Real OAuth UX + Gmail send pipeline = Phase 5. |
 
 ---
@@ -201,6 +202,30 @@ User's lean: **switch to bearer tokens** so we never need a domain. Plan when OA
 
 **Open until OAuth phase begins.** Until then nothing changes — the waitlist endpoint doesn't authenticate, so cookies/bearer doesn't matter.
 
+**2026-05-05 — Phase 3: TLS deployed on backend (Caddy + Let's Encrypt).**
+Production backend now serves at `https://knock-api.koreacentral.cloudapp.azure.com`. Zero code changes — pure infra. Concrete steps performed:
+1. Pre-flight: confirmed `curl http://localhost:8000/healthz` returned `{"status":"ok"}` on the VM. Discovered uvicorn is running **manually** from a pts/2 terminal session (not as a systemd unit) — PID 512012, started May 3, parent PID 511672 (likely tmux/screen). Won't survive a VM reboot. Flagged as a follow-up before Phase 4 deploys.
+2. Opened NSG inbound rules in Azure portal: HTTP/80 (priority 310, name `AllowHTTP`) and HTTPS/443 (priority 320, name `AllowHTTPS`). Verified externally with `nc -zv` — initially "connection refused" (correct: NSG allowing through, but nothing listening on 80/443 yet).
+3. UFW status check on VM — inactive, nothing to do.
+4. Installed Caddy from Cloudsmith repo (`dl.cloudsmith.io/public/caddyserver/stable`), not Ubuntu's default repos.
+5. Replaced `/etc/caddy/Caddyfile` entirely (deleted the default placeholder config) with:
+   ```
+   knock-api.koreacentral.cloudapp.azure.com {
+       reverse_proxy localhost:8000
+   }
+   ```
+6. `sudo systemctl reload caddy` + `journalctl -u caddy -f` to watch ACME flow. LE HTTP-01 challenge succeeded (5 validation IPs hit port 80, all served the right token). Cert obtained in ~5 seconds. Harmless OCSP-stapling warning logged ("no OCSP server specified in certificate") — LE removed OCSP server URLs from new certs in mid-2025; ignore.
+7. Verified end-to-end: `curl -i https://knock-api.koreacentral.cloudapp.azure.com/healthz` → HTTP/2 200 with `{"status":"ok"}`, server headers showing `Caddy` + `uvicorn`. `/readyz` returned `{"db":"ok","scheduler":"off-process"}` proving Caddy → uvicorn → Turso path is fully healthy. HTTP→HTTPS 308 redirect verified.
+8. Updated Vercel `BACKEND_URL` env var: `http://knock-api.koreacentral.cloudapp.azure.com:8000` → `https://knock-api.koreacentral.cloudapp.azure.com` (no port — defaults to 443). Redeployed frontend.
+9. Smoke-tested live waitlist via the new HTTPS path — submission succeeded, row landed in Turso.
+10. **NSG 8000 deliberately left open** at user's request. Documented as a deferred task — must be closed before Phase 4 OAuth code reaches production (bearer tokens over plain HTTP would be sniffable). See memory entry `project_deferred_close_nsg_8000.md` in the agent memory store.
+11. **Skipped:** Step 11 of the plan (updating `.env` for `GOOGLE_REDIRECT_URI` and restarting uvicorn). Defer to Phase 4 when OAuth wiring actually ships.
+12. **Skipped:** Step 10 of the plan (adding production redirect URI to Google OAuth Console). Defer until we know the OAuth client exists / set it up properly during Phase 4 prep.
+
+**Caveats / followups:**
+- uvicorn under tmux is fragile. **Before any Phase 4 deploy**: write `/etc/systemd/system/knock-api.service` (was the empty `deploy/systemd/` dir), enable + start it, kill the manual uvicorn. This way `git pull && systemctl restart knock-api` becomes the standard deploy path.
+- The Caddyfile is minimal. When OAuth ships, may want to add access logging (`log` directive) and rate limiting on `/auth/*` paths. Not blocking.
+
 **2026-05-05 — Bearer-token swap implemented (branch `feat/auth-bearer-tokens`).**
 Phase 2 from the roadmap. Concrete changes:
 - `app/core/deps.py` — `get_current_user` now reads `Authorization: Bearer <token>` via FastAPI's `HTTPBearer` security scheme. New dep `CurrentSessionToken` exposes the raw token to logout/disconnect. Bearer token IS the `sessions.id` (no hashing change in this PR; matches existing scheme).
@@ -219,19 +244,29 @@ Frontend changes (token store in sessionStorage, `Authorization` header injectio
 
 ## What's next (in order)
 
-1. **Verify NSG port 8000 is open** in the Azure portal (user task).
-2. **Deploy backend on the VM**: SSH in, clone repo, install deps, point `.env` at Turso, run `alembic upgrade head` (no-op on Turso since schema is there, but safe to re-run), start uvicorn (foreground first, then systemd unit `deploy/systemd/knock-api.service` after edits for `User=azureuser` and `/home/azureuser/...` paths).
-3. **From laptop**: `curl http://knock-api.koreacentral.cloudapp.azure.com:8000/healthz` should return `{"status":"ok"}`.
-4. **Import frontend to Vercel**, set env var `BACKEND_URL=http://knock-api.koreacentral.cloudapp.azure.com:8000`, deploy.
-5. **Submit a real email on the live URL**, verify row appears in Turso (web UI or `turso db shell knock` → `select * from waitlist;`).
-6. **Cut release**: merge `feat/waitlist-and-turso` to backend `main`, merge frontend to `main`. Open dev branch for OAuth/campaigns.
+**Phase 2 (`feat/auth-bearer-tokens`)** — PR open against `pre-release`. CI green, GitGuardian flagged a placeholder Fernet key in CI workflow (since fixed by generating ephemeral key at runtime). Awaiting user merge.
 
-Stretch (after waitlist is live):
-- **Switch auth model from cookies → bearer tokens** *before* implementing real OAuth (see 2026-05-03 OAuth log entry). Touches `app/routers/auth.py`, `app/core/deps.py`, `app/core/csrf.py`, `app/core/cookies.py`, and the frontend API client. Roughly 1 day. Lets us skip buying a domain.
-- ~~Buy domain (~$8/year)~~ → no longer needed if bearer-token plan holds. Revisit only if we change our minds about XSS risk on localStorage.
-- Add TLS to backend with Caddy + Let's Encrypt (uses the Azure DNS label `knock-api.koreacentral.cloudapp.azure.com` — works without a custom domain).
-- Write the soft-gate logic on the OAuth callback.
-- Pull the waitlist CSV when ready to email the launch announcement (use Knock itself once OAuth is live — eat the dog food).
+**Pre-Phase-4 housekeeping** — do these before deploying any OAuth code:
+1. **Write `/etc/systemd/system/knock-api.service` on the VM.** uvicorn is currently running manually from a tmux/pts session — won't survive VM reboot. Unit needs `User=azureuser`, `WorkingDirectory=/home/azureuser/outreach-backend`, `EnvironmentFile=.env`, `ExecStart=.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000`, `Restart=on-failure`. Then `systemctl enable --now knock-api`, kill the manual uvicorn.
+2. **Close NSG port 8000** (deferred during Phase 3 at user's request). Plain-text uvicorn must not be reachable when bearer tokens start flowing. See agent memory `project_deferred_close_nsg_8000.md`.
+3. **Set up Google OAuth client** in Google Cloud Console (or update existing one). Authorized redirect URIs: `https://knock-api.koreacentral.cloudapp.azure.com/auth/google/callback` (prod) + `http://localhost:8000/auth/google/callback` (dev). Note `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+4. **Confirm `TOKEN_ENCRYPTION_KEY` and `ADMIN_EMAILS` are set in VM `.env`.** ADMIN_EMAILS gets repurposed as the super_admin allowlist in Phase 4.
+5. **Update VM `.env`**: `GOOGLE_REDIRECT_URI=https://knock-api.koreacentral.cloudapp.azure.com/auth/google/callback`, `FRONTEND_ORIGIN` and `ALLOWED_ORIGINS` to the production Vercel URL.
+
+**Phase 4 — OAuth wiring + soft-gate + tier system + admin surface.** Multiple feature branches:
+- `feat/users-schema-extensions` — Alembic 0003 adds `users.waitlist_email` (TEXT NULL), `users.tier` (TEXT NOT NULL DEFAULT 'free' CHECK IN ('free','paid','super_admin')), `users.tier_set_at`. ~1 hour.
+- `feat/oauth-soft-gate` — wire `/auth/google/callback` for the waitlist match + super-admin allowlist + onboarding redirect. New `app/routers/onboarding.py` with `GET /api/v1/onboarding/status` and `POST /api/v1/onboarding/claim-waitlist`. ~1 day.
+- `feat/admin-router` — `/api/v1/admin/users`, `/admin/waitlist`, `/admin/users/{id}/tier`. All gated by `require_super_admin`. `include_in_schema=False`. ~½ day.
+
+**Phase 5 — Gmail send pipeline** (Phase 4's prerequisite for being a real product). Each is its own branch: gmail token storage (5.1), contacts CRUD (5.2), templates CRUD (5.3), campaigns + send_queue (5.4), global contact lock (5.5), send worker (5.6), email logs (5.7). ~5-7 days total.
+
+**Open policy questions** (answer before Phase 4 starts):
+1. Soft-gate behavior for OAuth users not on waitlist: hard-reject / let-in-as-free / show-waitlist-CTA-and-claim-later? (Recommended: third option.)
+2. Free-tier limits: contacts cap, templates cap, campaigns/month, recipients/campaign?
+3. Global contact lock window length? (Recommended: 7 days.)
+4. SUPER_ADMIN_EMAILS contents — just `mridul.chaudhary@joveo.com` or anyone else?
+
+**Deferred to v3:** Stripe / billing / paid upgrade flow. Tier transitions are manual via super_admin endpoint until then.
 
 ---
 
