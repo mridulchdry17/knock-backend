@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from collections.abc import Iterator
+
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.emails import normalize_email
@@ -29,3 +31,29 @@ def add_if_missing(db: OrmSession, email: str) -> tuple[WaitlistEntry, bool]:
     if existing is not None:
         return existing, False
     return add(db, email), True
+
+
+def list_paginated(
+    db: OrmSession, *, limit: int, offset: int
+) -> tuple[list[WaitlistEntry], int]:
+    """Returns (rows, total). Newest first."""
+    rows = list(
+        db.scalars(
+            select(WaitlistEntry)
+            .order_by(WaitlistEntry.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+    )
+    total = db.scalar(select(func.count()).select_from(WaitlistEntry)) or 0
+    return rows, total
+
+
+def stream_all(db: OrmSession) -> Iterator[WaitlistEntry]:
+    """Yields all rows in insertion order. For CSV export — uses .yield_per()
+    so we don't load the whole table into memory if it grows large."""
+    yield from db.scalars(
+        select(WaitlistEntry).order_by(WaitlistEntry.created_at.asc()).execution_options(
+            yield_per=500
+        )
+    )
