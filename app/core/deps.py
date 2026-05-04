@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Cookie, Depends, status
+from fastapi import Depends, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.errors import ApiError
@@ -11,24 +12,51 @@ from app.models import User
 from app.repositories import sessions as sessions_repo
 from app.repositories import users as users_repo
 
-SESSION_COOKIE = "session"
-
 DbDep = Annotated[OrmSession, Depends(get_db)]
+
+# auto_error=False so we can raise ApiError ourselves with a consistent envelope
+# instead of FastAPI's default 403 plain JSON.
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _extract_token(creds: HTTPAuthorizationCredentials | None) -> str:
+    if creds is None or not creds.credentials:
+        raise ApiError(
+            "unauthorized", "Not authenticated", status_code=status.HTTP_401_UNAUTHORIZED
+        )
+    return creds.credentials
+
+
+def get_current_session_token(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> str:
+    """The raw bearer token from the Authorization header.
+
+    Used by logout/disconnect to identify which session to revoke without
+    re-querying the DB. Other callers should depend on `CurrentUser` instead.
+    """
+    return _extract_token(creds)
+
+
+CurrentSessionToken = Annotated[str, Depends(get_current_session_token)]
 
 
 def get_current_user(
     db: DbDep,
-    session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> User:
-    if not session_cookie:
-        raise ApiError("unauthorized", "Not authenticated", status_code=status.HTTP_401_UNAUTHORIZED)
-    session = sessions_repo.get_active(db, session_cookie)
+    token = _extract_token(creds)
+    session = sessions_repo.get_active(db, token)
     if session is None:
-        raise ApiError("unauthorized", "Session expired", status_code=status.HTTP_401_UNAUTHORIZED)
+        raise ApiError(
+            "unauthorized", "Session expired", status_code=status.HTTP_401_UNAUTHORIZED
+        )
 
     user = users_repo.get(db, session.user_id)
     if user is None:
-        raise ApiError("unauthorized", "User not found", status_code=status.HTTP_401_UNAUTHORIZED)
+        raise ApiError(
+            "unauthorized", "User not found", status_code=status.HTTP_401_UNAUTHORIZED
+        )
     if user.is_suspended:
         raise ApiError(
             "account_suspended", "Account is suspended", status_code=status.HTTP_403_FORBIDDEN

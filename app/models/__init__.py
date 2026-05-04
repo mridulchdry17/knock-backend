@@ -12,15 +12,15 @@ from app.models.user_contact_map import UserContactMap
 from app.models.waitlist import WaitlistEntry
 
 __all__ = [
-    "User",
-    "Session",
+    "Campaign",
     "Company",
     "Contact",
-    "Template",
-    "Campaign",
-    "SendQueue",
-    "UserContactMap",
-    "GlobalContactLock",
     "EmailLog",
+    "GlobalContactLock",
+    "SendQueue",
+    "Session",
+    "Template",
+    "User",
+    "UserContactMap",
     "WaitlistEntry",
 ]

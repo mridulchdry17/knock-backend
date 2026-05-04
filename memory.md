@@ -6,19 +6,21 @@
 
 ---
 
-## Status snapshot (last updated: 2026-05-03)
+## Status snapshot (last updated: 2026-05-05)
 
 | Area | Status |
 |---|---|
-| Frontend repo | Live at `github.com/mridulchdry17/knock-frontend`, branch `main`. Not yet connected to Vercel. |
-| Frontend UI | Single landing page with email-only waitlist form. No other pages yet. |
+| Frontend repo | Live at `github.com/mridulchdry17/knock-frontend`, deployed on Vercel. |
+| Frontend UI | Single landing page with email-only waitlist form. |
 | Frontend → Backend wiring | Same-origin Next.js proxy at `/api/waitlist` → `${BACKEND_URL}/api/v1/waitlist`. Backend hostname kept out of the browser bundle. |
-| Backend repo | Live at `github.com/mridulchdry17/knock-backend`. Active dev branch: `feat/waitlist-and-turso` (waitlist endpoint + Turso support). Earlier branches: `docs/progress-and-frontend-spec`, `feat/google-oauth-and-sessions`, `feat/foundation-and-schema`. |
-| Backend deployment | **Not yet deployed.** VM provisioned but uvicorn not running. |
-| Database | Turso (libSQL) — `knock-mridulchdry17.aws-ap-south-1.turso.io`. Schema migrated (10 tables incl. `waitlist`, all empty in prod). 2 dev test rows present. |
-| Infra — Azure VM | Provisioned, public IP `40.82.143.50`, DNS label `knock-api.koreacentral.cloudapp.azure.com`. NSG port 8000 status unverified by user. Backend not running on it yet. |
-| Infra — Vercel | Frontend not yet imported. Will set env var `BACKEND_URL` once VM is live. |
-| OAuth / Gmail / sending | Not started. PRD Phase 2+ work — deferred until waitlist is live. |
+| Backend repo | Live at `github.com/mridulchdry17/knock-backend`. Active dev branch: `feat/auth-bearer-tokens`. Waitlist + Turso work merged to `main`. |
+| Backend deployment | **Live** on Azure VM at `http://knock-api.koreacentral.cloudapp.azure.com:8000`. systemd unit running. HTTP only — TLS planned (Phase 3, Caddy + Let's Encrypt). |
+| Database | Turso (libSQL) — `knock-mridulchdry17.aws-ap-south-1.turso.io`. Schema migrated (10 tables incl. `waitlist`). Real signups landing in production. |
+| Auth model | **Bearer tokens**, not cookies (Phase 2, branch `feat/auth-bearer-tokens`). Session token = raw `sessions.id`, transported via `Authorization: Bearer <token>`. OAuth callback redirects to `${FRONTEND_ORIGIN}/auth/complete?next=...#token=...` — fragment never reaches the server. CSRF middleware deleted (no cookies = no CSRF). `oauth_state` cookie remains for the OAuth round-trip (same-origin, backend-only). Frontend changes live in knock-frontend repo. |
+| Three user tiers | Planned: `free` / `paid` / `super_admin`. Schema column + tier-gating dependencies arrive in Phase 4 (not yet built). Existing `users.is_admin` boolean unchanged for now. |
+| Billing | **Deferred to v3.** No Stripe in v1/v2. Tier transitions are manual via super_admin endpoints once Phase 4 ships. |
+| Infra — Azure VM | Public IP `40.82.143.50`, DNS label `knock-api.koreacentral.cloudapp.azure.com`. NSG 8000 open. |
+| OAuth / Gmail / sending | OAuth routes wired, unused in production. Real OAuth UX + Gmail send pipeline = Phase 5. |
 
 ---
 
@@ -179,6 +181,40 @@ Decided that when OAuth ships, we'll do a "soft gate": OAuth callback creates th
 **2026-05-03 — Email volume sanity check.**
 At PRD's 100-user verification cap and a year of activity, projected DB size is ~590 MB — well under Turso's 9 GB free tier. The actual ceiling is SQLite's single-writer concurrency (PRD §5), not Turso's storage. Migration to Postgres (Neon) is a planned step at ~50 concurrent users. Nothing to do now.
 
+**2026-05-03 — Walked back the no-presence-leak design on the waitlist endpoint.**
+Originally `POST /api/v1/waitlist` returned `200 {ok:true}` for both new and duplicate signups specifically so the endpoint couldn't be used as a presence oracle. We changed this: duplicate now returns `409 {error:{code:"already_registered", ...}}`. Reasoning: this is a public marketing waitlist, not a privacy-sensitive list — every well-known waitlist (Mailchimp, Substack, Notion, etc.) tells you "you're already subscribed." Without that signal, repeat-submitters re-fire network calls + double-count in Vercel Analytics + don't get the closure-feedback that they're already in. Frontend now shows a distinct "You're already on the list" success card on 409 vs the regular "You're on the list" card on 200. Also added Vercel Analytics `track('waitlist_signup', {domain})` only on the genuine 200 path so the conversion count is unique signups (not re-submits). The DB UNIQUE constraint was already enforcing data integrity — this change is purely about UX + analytics cleanliness.
+
+**2026-05-03 — OAuth auth model: switch from cookies to bearer tokens (decision pending).**
+Re-examined the cookie-based session model when user pointed out we don't have a domain. The PRD's design uses an HTTP-only `session` cookie set on the backend domain, scoped to a parent domain (`Domain=.knock.app`) so both `app.knock.app` (frontend) and `api.knock.app` (backend) receive it. **This requires a domain we own** — `*.vercel.app` and `*.cloudapp.azure.com` can't share cookies because (a) we don't own the parent and (b) both are on the Public Suffix List, which browsers explicitly forbid setting `Domain=` cookies on. DuckDNS has the same PSL problem.
+
+User's lean: **switch to bearer tokens** so we never need a domain. Plan when OAuth phase begins:
+- Backend issues an opaque session token (or signed JWT) at the end of OAuth callback, returns it in JSON response body instead of `Set-Cookie`.
+- Frontend stores it (in `localStorage` or, better, in a closure/in-memory + `sessionStorage` for less XSS surface).
+- Frontend sends it on every API call as `Authorization: Bearer <token>`.
+- `app/core/deps.py::get_current_user` reads from `Authorization` header instead of `Cookie`.
+- The `sessions` table stays — it's still the source of truth, just keyed by the bearer token instead of a cookie value.
+- Drop the CSRF middleware entirely (no cookies = no CSRF). The `X-Requested-With` requirement on `/api/v1/*` becomes unnecessary; we'd remove it.
+- Logout = delete the session row (same as today) + frontend wipes its stored token.
+- Backend changes affected: `app/routers/auth.py` (callback returns JSON not redirect, or redirects with token in URL fragment), `app/core/deps.py` (read header), `app/core/csrf.py` (delete or no-op), `app/core/cookies.py` (delete or shrink). Frontend gains a small token-store module + Authorization-header injection in its API client.
+
+**Risks acknowledged:** bearer-in-localStorage is XSS-vulnerable (any JS injection grabs the token); can't be `httpOnly`; harder to invalidate centrally (we still have the sessions table so it's revocable, just slower than cookie-clearing). Mitigations: strict CSP, rotate tokens on refresh, short TTL with refresh tokens. We accept this trade as the cost of not buying a domain.
+
+**Open until OAuth phase begins.** Until then nothing changes — the waitlist endpoint doesn't authenticate, so cookies/bearer doesn't matter.
+
+**2026-05-05 — Bearer-token swap implemented (branch `feat/auth-bearer-tokens`).**
+Phase 2 from the roadmap. Concrete changes:
+- `app/core/deps.py` — `get_current_user` now reads `Authorization: Bearer <token>` via FastAPI's `HTTPBearer` security scheme. New dep `CurrentSessionToken` exposes the raw token to logout/disconnect. Bearer token IS the `sessions.id` (no hashing change in this PR; matches existing scheme).
+- `app/core/cookies.py` — dropped `set_session_cookie`/`clear_session_cookie`/`SESSION_COOKIE`. Kept `oauth_state` helpers — that cookie is same-origin (backend domain only) and required to bind the OAuth round-trip.
+- `app/core/csrf.py` — **deleted**. No cookies = no CSRF surface.
+- `app/main.py` — removed `CSRFHeaderMiddleware`. CORS dropped `X-Requested-With` from allow-headers, flipped `allow_credentials=False` (correct now that we're not sending cookies cross-origin).
+- `app/routers/auth.py` — `/auth/google/callback` redirects to `${FRONTEND_ORIGIN}/auth/complete?next=<onboarding|dashboard>#token=<session.id>`. Fragment is browser-only, never reaches the server, doesn't appear in access logs or `Referer` headers. Logout/disconnect take `CurrentSessionToken` instead of `Cookie(SESSION_COOKIE)`.
+- `.github/workflows/ci.yml` — first CI workflow: ruff check + import smoke + `alembic upgrade head` against ephemeral SQLite. Pytest step is conditional (skips if no `tests/test_*.py`). Required before merge.
+- Pre-existing lint errors fixed (unused imports, sorted `__all__`, `contextlib.suppress` rewrite). Ruff now clean.
+
+Tier-gating helpers (`require_tier`, `require_super_admin`, `require_paid`) **deferred to Phase 4** PR — they need `users.tier` column which doesn't exist yet. Adding them now would be dead code referencing a missing attribute.
+
+Frontend changes (token store in sessionStorage, `Authorization` header injection, `/auth/complete` route) live in the knock-frontend repo — separate PR.
+
 ---
 
 ## What's next (in order)
@@ -191,8 +227,9 @@ At PRD's 100-user verification cap and a year of activity, projected DB size is 
 6. **Cut release**: merge `feat/waitlist-and-turso` to backend `main`, merge frontend to `main`. Open dev branch for OAuth/campaigns.
 
 Stretch (after waitlist is live):
-- Buy domain (~$8/year) → switch backend to `api.knock.<tld>` → start OAuth work on backend dev branch.
-- Add TLS to backend with Caddy + Let's Encrypt (uses the Azure DNS label or the new domain).
+- **Switch auth model from cookies → bearer tokens** *before* implementing real OAuth (see 2026-05-03 OAuth log entry). Touches `app/routers/auth.py`, `app/core/deps.py`, `app/core/csrf.py`, `app/core/cookies.py`, and the frontend API client. Roughly 1 day. Lets us skip buying a domain.
+- ~~Buy domain (~$8/year)~~ → no longer needed if bearer-token plan holds. Revisit only if we change our minds about XSS risk on localStorage.
+- Add TLS to backend with Caddy + Let's Encrypt (uses the Azure DNS label `knock-api.koreacentral.cloudapp.azure.com` — works without a custom domain).
 - Write the soft-gate logic on the OAuth callback.
 - Pull the waitlist CSV when ready to email the launch announcement (use Knock itself once OAuth is live — eat the dog food).
 
@@ -206,6 +243,7 @@ Stretch (after waitlist is live):
 - **Alembic builds its own engine.** Initial implementation of `alembic/env.py` did `engine_from_config(...)` which bypassed our `_build_engine()` and dropped the `auth_token` connect_arg. Fixed by importing and reusing `engine` from `app.db.base`.
 - **Vercel `NEXT_PUBLIC_*` vars are baked into the client JS bundle.** Used to leak the backend URL. Fixed by switching to the proxy with a server-only `BACKEND_URL`. Verified via grep across `_next/static/chunks/*.js`.
 - **Azure VMs block ICMP by default.** `ping <hostname>` fails even when the host is up. Don't use ping to check liveness — use `curl :22` for SSH or `curl :8000/healthz` for the backend.
+- **`isolation_level="AUTOCOMMIT"` doesn't auto-commit ad-hoc `engine.connect().execute(...)` on libsql.** Despite the engine option, raw DML through `engine.connect()` silently rolls back when the connection closes — the row appears deleted in that connection's view but the change never reaches Turso. **Workaround:** use `with engine.begin() as c:` for any ad-hoc DML from the shell — this opens an explicit transaction and commits on context-manager exit. The app's normal request flow is unaffected because `app/routers/*` use the SQLAlchemy `Session` and call `db.commit()` explicitly, which works correctly.
 
 ---
 
