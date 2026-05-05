@@ -34,11 +34,9 @@ class User(Base, TimestampMixin):
     sender_signature_name: Mapped[str | None] = mapped_column(String(255))
     sender_signature_city: Mapped[str | None] = mapped_column(String(255))
 
-    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_suspended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # Phase 4 — soft-gate + tier model. See memory.md log entries 2026-05-05.
-    # `is_admin` is being phased out; reads should prefer `tier == 'super_admin'`.
+    # Phase 4 soft-gate + tier model. See memory.md log entries 2026-05-05.
     waitlist_email: Mapped[str | None] = mapped_column(String(255), unique=True)
     tier: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     tier_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -49,4 +47,7 @@ class User(Base, TimestampMixin):
 
     @property
     def is_onboarded(self) -> bool:
-        return bool(self.sender_signature_name)
+        """A user is onboarded once they have claimed (or been auto-claimed
+        for) a waitlist email. Pending users with `waitlist_email IS NOT NULL`
+        are still onboarded but awaiting approval — see `tier`."""
+        return self.waitlist_email is not None

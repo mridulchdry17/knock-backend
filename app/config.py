@@ -47,15 +47,18 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
     RUN_SCHEDULER: bool = False
-    ADMIN_EMAILS: str = ""
+
+    # Comma-separated emails auto-promoted to tier='super_admin' on every login.
+    # Renamed from ADMIN_EMAILS in Phase 4 to disambiguate from feature tiers.
+    SUPER_ADMIN_EMAILS: str = ""
 
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
     @property
-    def admin_emails_set(self) -> set[str]:
-        return {e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()}
+    def super_admin_emails_set(self) -> set[str]:
+        return {e.strip().lower() for e in self.SUPER_ADMIN_EMAILS.split(",") if e.strip()}
 
     @property
     def is_prod(self) -> bool:
