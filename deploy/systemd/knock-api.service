@@ -1,0 +1,44 @@
+[Unit]
+Description=Knock FastAPI backend (uvicorn)
+Documentation=https://github.com/mridulchdry17/knock-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/outreach-backend
+EnvironmentFile=/home/azureuser/outreach-backend/.env
+
+# Bind to loopback only — public traffic enters via Caddy on :443.
+# Defense-in-depth: even if NSG 8000 is ever reopened, uvicorn isn't reachable.
+ExecStart=/home/azureuser/outreach-backend/.venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1
+
+# `on-failure` (not `always`) so explicit `systemctl stop` actually stops it.
+Restart=on-failure
+RestartSec=3
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Send SIGTERM to main, then SIGKILL to any stragglers after timeout.
+KillMode=mixed
+TimeoutStopSec=10
+
+# Logs go to journald — view with `journalctl -u knock-api -f`.
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — minimal, doesn't break the app.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/azureuser/outreach-backend
+
+[Install]
+WantedBy=multi-user.target
