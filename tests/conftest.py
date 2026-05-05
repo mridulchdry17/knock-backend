@@ -26,6 +26,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 
@@ -46,10 +47,14 @@ from app.models import (  # noqa: F401
 
 @pytest.fixture
 def engine() -> Iterator[Engine]:
+    # StaticPool keeps a single underlying connection across all sessions, which
+    # is what we need for sqlite:///:memory: — otherwise every fresh checkout
+    # gets a brand-new empty database.
     eng = create_engine(
         "sqlite:///:memory:",
         future=True,
         connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
     Base.metadata.create_all(eng)
     try:

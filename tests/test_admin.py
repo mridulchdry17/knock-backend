@@ -1,0 +1,254 @@
+"""Admin router tests — gating, tier mutations, pagination, CSV export.
+
+Uses FastAPI TestClient against the live app, with `get_db` and
+`get_current_user` overridden so tests focus on admin logic rather than the
+session/bearer plumbing (which is covered by the Phase 2 auth tests).
+"""
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.core.deps import get_current_user
+from app.db.session import get_db
+from app.main import app
+from app.models import User
+from app.repositories import waitlist as waitlist_repo
+from tests.conftest import _make_user
+
+
+@pytest.fixture
+def client_factory(engine: Engine):
+    """Returns a callable that mounts a TestClient with the given user as
+    `get_current_user`. Pass `user=None` to test unauthenticated.
+
+    The DB session shared with the request handler is the same engine as
+    the `db` fixture (via StaticPool), so mutations are visible across both.
+    """
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    def _make(user: User | None) -> TestClient:
+        def _override_get_db():
+            s = factory()
+            try:
+                yield s
+            finally:
+                s.close()
+
+        def _override_get_current_user():
+            if user is None:
+                from fastapi import status
+
+                from app.core.errors import ApiError
+
+                raise ApiError(
+                    "unauthorized",
+                    "Not authenticated",
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                )
+            return user
+
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[get_current_user] = _override_get_current_user
+        return TestClient(app)
+
+    yield _make
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def super_admin(db: Session) -> User:
+    return _make_user(
+        db,
+        email="admin@knock.app",
+        google_sub="g-admin",
+        tier="super_admin",
+        waitlist_email="admin@knock.app",
+    )
+
+
+# ─────────────────────────── gating ───────────────────────────
+
+
+def test_unauthenticated_returns_401(client_factory) -> None:
+    client = client_factory(None)
+    r = client.get("/api/v1/admin/users")
+    assert r.status_code == 401
+
+
+def test_free_user_gets_403(client_factory, db: Session) -> None:
+    user = _make_user(
+        db, email="user@example.com", tier="free", waitlist_email="user@example.com"
+    )
+    client = client_factory(user)
+    r = client.get("/api/v1/admin/users")
+    assert r.status_code == 403
+
+
+def test_pending_user_gets_403(client_factory, db: Session) -> None:
+    user = _make_user(db, email="pending@example.com", tier="pending")
+    client = client_factory(user)
+    r = client.get("/api/v1/admin/users")
+    assert r.status_code == 403
+
+
+def test_paid_user_gets_403(client_factory, db: Session) -> None:
+    """Paid users are NOT super_admin — admin endpoints reject them."""
+    user = _make_user(
+        db, email="paid@example.com", tier="paid", waitlist_email="paid@example.com"
+    )
+    client = client_factory(user)
+    r = client.get("/api/v1/admin/users")
+    assert r.status_code == 403
+
+
+def test_super_admin_gets_200(client_factory, super_admin: User) -> None:
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/users")
+    assert r.status_code == 200
+    body = r.json()
+    assert "items" in body
+    assert "total" in body
+
+
+# ─────────────────────────── filtering ───────────────────────────
+
+
+def test_filter_users_by_tier(client_factory, db: Session, super_admin: User) -> None:
+    _make_user(db, email="p1@x.com", google_sub="g-p1", tier="pending")
+    _make_user(db, email="p2@x.com", google_sub="g-p2", tier="pending")
+    _make_user(db, email="f1@x.com", google_sub="g-f1", tier="free", waitlist_email="f1@x.com")
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/users?tier=pending")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2
+    assert all(u["tier"] == "pending" for u in body["items"])
+
+
+def test_search_users_by_email_substring(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    _make_user(
+        db,
+        email="alice@founders.com",
+        google_sub="g-1",
+        tier="free",
+        waitlist_email="alice@founders.com",
+    )
+    _make_user(
+        db,
+        email="bob@elsewhere.com",
+        google_sub="g-2",
+        tier="free",
+        waitlist_email="bob@elsewhere.com",
+    )
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/users?search=founders")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 1
+    assert items[0]["email"] == "alice@founders.com"
+
+
+# ─────────────────────────── tier update ───────────────────────────
+
+
+def test_promote_pending_to_free(client_factory, db: Session, super_admin: User) -> None:
+    pending = _make_user(db, email="p@x.com", google_sub="g-p", tier="pending")
+    client = client_factory(super_admin)
+
+    r = client.patch(
+        f"/api/v1/admin/users/{pending.id}/tier",
+        json={"tier": "free"},
+    )
+    assert r.status_code == 200
+    assert r.json()["tier"] == "free"
+
+    db.refresh(pending)
+    assert pending.tier == "free"
+    assert pending.tier_set_at is not None
+
+
+def test_invalid_tier_returns_422(client_factory, db: Session, super_admin: User) -> None:
+    pending = _make_user(db, email="p@x.com", google_sub="g-p", tier="pending")
+    client = client_factory(super_admin)
+
+    r = client.patch(
+        f"/api/v1/admin/users/{pending.id}/tier",
+        json={"tier": "wizard"},
+    )
+    assert r.status_code == 422
+
+
+def test_tier_update_unknown_user(client_factory, super_admin: User) -> None:
+    client = client_factory(super_admin)
+    r = client.patch(
+        "/api/v1/admin/users/99999/tier",
+        json={"tier": "free"},
+    )
+    assert r.status_code == 404
+
+
+# ─────────────────────────── waitlist ───────────────────────────
+
+
+def test_list_waitlist(client_factory, db: Session, super_admin: User) -> None:
+    waitlist_repo.add(db, "first@example.com")
+    waitlist_repo.add(db, "second@example.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2
+
+
+def test_waitlist_csv_export(client_factory, db: Session, super_admin: User) -> None:
+    waitlist_repo.add(db, "x@y.com")
+    waitlist_repo.add(db, "y@z.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist.csv")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert "attachment" in r.headers.get("content-disposition", "")
+    body = r.text
+    assert "id,email,created_at" in body
+    assert "x@y.com" in body
+    assert "y@z.com" in body
+
+
+# ─────────────────────────── pagination bounds ───────────────────────────
+
+
+def test_invalid_pagination_returns_422(client_factory, super_admin: User) -> None:
+    client = client_factory(super_admin)
+
+    assert client.get("/api/v1/admin/users?limit=0").status_code == 422
+    assert client.get("/api/v1/admin/users?limit=300").status_code == 422
+    assert client.get("/api/v1/admin/users?offset=-1").status_code == 422
+
+
+# ─────────────────────────── suspend/unsuspend ───────────────────────────
+
+
+def test_suspend_and_unsuspend(client_factory, db: Session, super_admin: User) -> None:
+    user = _make_user(
+        db, email="u@x.com", google_sub="g-u", tier="free", waitlist_email="u@x.com"
+    )
+    client = client_factory(super_admin)
+
+    r = client.post(f"/api/v1/admin/users/{user.id}/suspend")
+    assert r.status_code == 200
+    assert r.json()["is_suspended"] is True
+
+    r = client.post(f"/api/v1/admin/users/{user.id}/unsuspend")
+    assert r.status_code == 200
+    assert r.json()["is_suspended"] is False
