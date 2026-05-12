@@ -9,6 +9,7 @@ from app.models.session import Session
 from app.models.template import Template
 from app.models.user import User
 from app.models.user_contact_map import UserContactMap
+from app.models.user_contact_note import UserContactNote
 from app.models.user_excluded_domain import UserExcludedDomain
 from app.models.waitlist import WaitlistEntry
 
@@ -23,6 +24,7 @@ __all__ = [
     "Template",
     "User",
     "UserContactMap",
+    "UserContactNote",
     "UserExcludedDomain",
     "WaitlistEntry",
 ]

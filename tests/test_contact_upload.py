@@ -108,6 +108,77 @@ def test_upload_csv_happy_path(client_factory, db: Session, super_admin: User) -
     assert company.domain == "estuate.com"
 
 
+def test_upload_preserves_notes_and_source(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """B5.1b: the fixture's notes/source columns round-trip onto Contact rows."""
+    client = client_factory(super_admin)
+    _upload_csv(client)
+
+    # Row with non-empty Notes
+    c = contacts_repo.get_by_email(db, "akanksha.puri@sourcefuse.com")
+    assert c is not None
+    assert c.notes == "Hires interns each spring; former IIT-D."
+    assert c.source == "manual-2026-dump"
+
+    # Row with empty Notes (whitespace-only) → None, source still set
+    c2 = contacts_repo.get_by_email(db, "akanksha.sogani@perennialsys.com")
+    assert c2 is not None
+    assert c2.notes is None
+    assert c2.source == "manual-2026-dump"
+
+
+def test_upload_doesnt_clobber_existing_notes(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """Re-upload a row with empty notes — original notes are preserved."""
+    client = client_factory(super_admin)
+    # Initial upload sets notes
+    r = client.post(
+        "/api/v1/admin/contacts/bulk",
+        json={
+            "rows": [
+                {
+                    "email": "alice@acme.com",
+                    "name": "Alice",
+                    "notes": "Met at hackathon.",
+                    "source": "referral-aman",
+                }
+            ]
+        },
+    )
+    assert r.status_code == 200
+
+    # Re-upload same email, no notes/source
+    r = client.post(
+        "/api/v1/admin/contacts/bulk",
+        json={"rows": [{"email": "alice@acme.com", "name": "Alice Chen"}]},
+    )
+    assert r.status_code == 200
+    assert r.json()["updated"] == 1
+
+    db.expire_all()
+    c = contacts_repo.get_by_email(db, "alice@acme.com")
+    assert c is not None
+    assert c.name == "Alice Chen"
+    assert c.notes == "Met at hackathon."  # preserved
+    assert c.source == "referral-aman"  # preserved
+
+
+def test_admin_contact_out_includes_notes_and_source(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    client = client_factory(super_admin)
+    _upload_csv(client)
+
+    r = client.get("/api/v1/admin/contacts?search=akanksha.puri")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 1
+    assert items[0]["notes"] == "Hires interns each spring; former IIT-D."
+    assert items[0]["source"] == "manual-2026-dump"
+
+
 def test_upload_dedup(client_factory, db: Session, super_admin: User) -> None:
     client = client_factory(super_admin)
     first = _upload_csv(client)

@@ -83,6 +83,7 @@ class AdminContactOut(BaseModel):
     company_domain: str
     linkedin_url: str | None
     source: str | None
+    notes: str | None
     scraped_pattern: str | None
     is_invalid: bool
     created_at: datetime
