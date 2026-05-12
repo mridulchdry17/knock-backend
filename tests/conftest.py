@@ -41,6 +41,7 @@ from app.models import (  # noqa: F401
     Template,
     User,
     UserContactMap,
+    UserExcludedDomain,
     WaitlistEntry,
 )
 

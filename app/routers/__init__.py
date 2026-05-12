@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import admin, auth, health, onboarding, waitlist
+from app.routers import admin, auth, health, onboarding, preferences, waitlist
 
 
 def register(app: FastAPI) -> None:
@@ -10,3 +10,4 @@ def register(app: FastAPI) -> None:
     app.include_router(waitlist.router)
     app.include_router(onboarding.router)
     app.include_router(admin.router)
+    app.include_router(preferences.router)
