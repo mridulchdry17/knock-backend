@@ -22,8 +22,12 @@ class Contact(Base, CreatedAtMixin):
     email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_invalid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     linkedin_url: Mapped[str | None] = mapped_column(String(512))
+    # Set by future scraper to record which guess pattern produced this address
+    # (e.g. "firstname.lastname"). Used by B5.5 to try an alternate pattern on
+    # bounce.
+    scraped_pattern: Mapped[str | None] = mapped_column(String(64))
 
     __table_args__ = (
-        UniqueConstraint("company_id", "email", name="uq_contact_company_email"),
+        UniqueConstraint("email", name="uq_contacts_email"),
         Index("idx_contacts_company", "company_id"),
     )
