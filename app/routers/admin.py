@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from app.core.deps import DbDep, SuperAdminUser
 from app.core.errors import ApiError
 from app.core.pagination import PaginationParams, pagination
-from app.logging import get_logger
+from app.logging_config import get_logger
 from app.repositories import users as users_repo
 from app.repositories import waitlist as waitlist_repo
 from app.schemas.admin import (

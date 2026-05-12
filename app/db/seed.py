@@ -6,7 +6,7 @@ login (see auth flow). System-wide reference data lands here when needed.
 from __future__ import annotations
 
 from app.db.base import SessionLocal
-from app.logging import configure_logging, get_logger
+from app.logging_config import configure_logging, get_logger
 
 
 def main() -> None:
