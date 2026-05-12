@@ -70,22 +70,32 @@ def _build_flow(redirect_uri: str, state: str | None = None) -> Flow:
     return flow
 
 
-def build_authorization_url(redirect_uri: str) -> tuple[str, str]:
-    """Return (authorization_url, state). State must be persisted (cookie) and
-    re-verified on callback."""
+def build_authorization_url(redirect_uri: str) -> tuple[str, str, str]:
+    """Return (authorization_url, state, code_verifier).
+
+    State + code_verifier must both be persisted (cookies) and re-supplied on
+    callback. Google's OAuth server now requires PKCE on the token-exchange
+    leg even for confidential web clients — without `code_verifier` the
+    exchange fails with `invalid_grant: Missing code verifier`.
+    """
     flow = _build_flow(redirect_uri)
+    flow.autogenerate_code_verifier = True
     auth_url, state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
     )
-    return auth_url, state
+    return auth_url, state, flow.code_verifier
 
 
-def exchange_code(code: str, state: str, redirect_uri: str) -> GoogleIdentity:
+def exchange_code(
+    code: str, state: str, redirect_uri: str, code_verifier: str | None = None
+) -> GoogleIdentity:
     """Exchange the OAuth code for tokens and identity. Validates required scopes
     and verifies the id_token. Returns a frozen GoogleIdentity."""
     flow = _build_flow(redirect_uri, state=state)
+    if code_verifier:
+        flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
 
     creds = flow.credentials
