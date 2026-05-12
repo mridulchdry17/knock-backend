@@ -94,3 +94,32 @@ class CompanySummaryOut(BaseModel):
     company_name: str
     company_domain: str
     contact_count: int
+
+
+# ─────────────────────────── locks (B5.3) ───────────────────────────
+
+
+class AdminGlobalLockOut(BaseModel):
+    """Active 36h platform cooldown row (admin view)."""
+
+    company_domain: str
+    locked_at: datetime
+    locked_until: datetime
+    last_locked_by_user_id: int | None
+
+
+class AdminPlatformLockOut(BaseModel):
+    """Platform-wide permanent stop (admin view)."""
+
+    company_domain: str
+    reason: str
+    created_at: datetime
+
+
+class AdminUserCompanyLockOut(BaseModel):
+    user_id: int
+    company_domain: str
+    locked_at: datetime
+    locked_until: datetime
+    is_permanent: bool
+    reason: str

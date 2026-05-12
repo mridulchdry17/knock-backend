@@ -1,24 +1,38 @@
 """Contacts router — user-facing endpoints.
 
-B5.1b ships just the per-user notes endpoints (`/{contact_id}/my-notes`).
-B5.3 will add the read-only contact browser (list/detail) on this same router.
+B5.1b shipped the per-user notes endpoints (`/{contact_id}/my-notes`).
+B5.3 adds the read-only contact browser (list + detail) on this same router.
 
-Layered: router validates payload + ownership, repositories own SQL. No
-service layer yet — the surface is too thin to earn one. When B5.3 lands
-list/detail with filtering, factor a service if logic crosses the third
-occurrence threshold.
+Layered: router validates payload + ownership, service owns lock semantics,
+repositories own SQL. The browse endpoint pre-filters exclusions/locks at
+the SQL layer (one round-trip) and surfaces 36h cooldown state per-row via
+`availability` — see `list_available_contacts` for the rationale.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Response, status
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query, Response, status
 
 from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
+from app.core.pagination import PaginationParams, pagination
+from app.core.time import utcnow
 from app.logging_config import get_logger
 from app.repositories import contacts as contacts_repo
+from app.repositories import locks as locks_repo
+from app.repositories import preferences as prefs_repo
 from app.repositories import user_contact_notes as notes_repo
+from app.schemas.admin import Page
 from app.schemas.common import Ok
-from app.schemas.contacts import MyContactNoteIn, MyContactNoteOut
+from app.schemas.contacts import (
+    ContactAvailability,
+    ContactBrowseOut,
+    ContactDetailOut,
+    MyContactNoteIn,
+    MyContactNoteOut,
+)
+from app.services import locks as locks_svc
 
 router = APIRouter(
     prefix="/api/v1/contacts",
@@ -39,6 +53,134 @@ def _require_contact_exists(db, contact_id: int) -> None:
             "Contact not found.",
             status_code=status.HTTP_404_NOT_FOUND,
         )
+
+
+def _availability_from_lock(result: locks_svc.LockCheckResult) -> ContactAvailability:
+    return ContactAvailability(
+        status=result.status.value,  # type: ignore[arg-type]
+        available_at=result.unlocked_at,
+        reason=result.reason,
+    )
+
+
+# ─────────────────────────── browse (B5.3) ───────────────────────────
+
+
+@router.get("", response_model=Page[ContactBrowseOut])
+def list_available_contacts(
+    user: CurrentUser,
+    db: DbDep,
+    page: Annotated[PaginationParams, Depends(pagination)],
+    search: Annotated[str | None, Query(max_length=128)] = None,
+    company_domain: Annotated[str | None, Query(max_length=255)] = None,
+) -> Page[ContactBrowseOut]:
+    """User-facing browse — read-only view of the admin-curated contact pool.
+
+    Hard-filtered out (will not appear at all):
+      - Contacts whose company domain is in the user's excluded-domains list
+      - Contacts under a platform-permanent lock (explicit-stop)
+      - Contacts under this user's per-user reply lock (active rows only —
+        permanent flag or `locked_until > now`)
+      - Invalid contacts (`is_invalid=True`)
+
+    Soft-surfaced via `availability` (still listed, but with status):
+      - 36h platform cooldown — user can see "available in 12h"
+
+    Rationale for the soft-surface vs hard-filter split: the platform cooldown
+    is short and rolling; hiding contacts during it would create a churny UX.
+    Permanent and per-user reply locks are long-lived and contextually
+    actionable elsewhere (Inbox), so hiding them is correct.
+
+    Tier-gated to free/paid/super_admin via the router-level dependency.
+    """
+    now = utcnow()
+
+    # Build the pre-filter domain set in one pass — caller-side merge avoids
+    # three SQL round-trips for what's typically a small set.
+    excluded_rows = prefs_repo.list_excluded_domains(db, user.id)
+    excluded_domains: set[str] = {row.domain for row in excluded_rows}
+
+    platform_locks = locks_repo.list_platform_locks(db)
+    excluded_domains.update(lock.company_domain for lock in platform_locks)
+
+    user_locks = locks_repo.list_active_user_locks(db, user.id, now=now)
+    excluded_domains.update(lock.company_domain for lock in user_locks)
+
+    pairs, total = contacts_repo.list_browse_paginated(
+        db,
+        exclude_domains=excluded_domains,
+        search=search,
+        company_domain=company_domain,
+        limit=page.limit,
+        offset=page.offset,
+    )
+
+    # Per-row availability: the only remaining possibility on browse rows is
+    # AVAILABLE or PLATFORM_COOLDOWN (the other two states were hard-filtered).
+    # We still go through the service so the result shape is consistent across
+    # browse and detail, and any future status added to the enum lights up here
+    # without a router change.
+    items: list[ContactBrowseOut] = []
+    for contact, company in pairs:
+        avail = locks_svc.check_can_send_to_company(
+            db, user_id=user.id, company_domain=company.domain
+        )
+        items.append(
+            ContactBrowseOut(
+                id=contact.id,
+                email=contact.email or "",
+                name=contact.name,
+                role=contact.role,
+                company_id=company.id,
+                company_name=company.name,
+                company_domain=company.domain,
+                availability=_availability_from_lock(avail),
+            )
+        )
+
+    return Page(items=items, total=total, limit=page.limit, offset=page.offset)
+
+
+@router.get("/{contact_id}", response_model=ContactDetailOut)
+def get_contact_detail(
+    contact_id: int, user: CurrentUser, db: DbDep
+) -> ContactDetailOut:
+    """Hydrates: contact row + company + admin-curated notes + user's private notes + lock state.
+
+    Detail differs from browse in two ways:
+      - It does NOT hard-filter — admins/users following a deep link to a
+        locked contact should see WHY it's locked, not 404.
+      - It surfaces the full lock state (including PLATFORM_PERMANENT and
+        USER_REPLY_LOCK) so the UI can render the appropriate locked-state
+        microcopy.
+    """
+    pair = contacts_repo.get_with_company(db, contact_id)
+    if pair is None:
+        raise ApiError(
+            "not_found",
+            "Contact not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    contact, company = pair
+
+    my_note = notes_repo.get(db, user.id, contact_id)
+    avail = locks_svc.check_can_send_to_company(
+        db, user_id=user.id, company_domain=company.domain
+    )
+
+    return ContactDetailOut(
+        id=contact.id,
+        email=contact.email or "",
+        name=contact.name,
+        role=contact.role,
+        company_id=company.id,
+        company_name=company.name,
+        company_domain=company.domain,
+        linkedin_url=contact.linkedin_url,
+        shared_notes=contact.notes,
+        my_notes=my_note.notes if my_note is not None else None,
+        availability=_availability_from_lock(avail),
+    )
 
 
 # ─────────────────────────── per-user notes ───────────────────────────
