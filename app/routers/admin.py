@@ -20,12 +20,16 @@ from fastapi.responses import StreamingResponse
 from app.core.deps import DbDep, SuperAdminUser
 from app.core.errors import ApiError
 from app.core.pagination import PaginationParams, pagination
+from app.core.time import utcnow
 from app.logging_config import get_logger
 from app.repositories import contacts as contacts_repo
+from app.repositories import locks as locks_repo
 from app.repositories import users as users_repo
 from app.repositories import waitlist as waitlist_repo
 from app.schemas.admin import (
     AdminContactOut,
+    AdminGlobalLockOut,
+    AdminPlatformLockOut,
     AdminUserOut,
     AdminWaitlistOut,
     CompanySummaryOut,
@@ -286,6 +290,92 @@ def delete_contact(_admin: SuperAdminUser, db: DbDep, contact_id: int) -> Ok:
     db.commit()
     log.info("admin.contact_deleted", contact_id=contact_id)
     return Ok()
+
+
+# ─────────────────────────── locks (B5.3) ───────────────────────────
+
+
+@router.get("/locks/global", response_model=Page[AdminGlobalLockOut])
+def list_global_locks(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    page: Annotated[PaginationParams, Depends(pagination)],
+) -> Page[AdminGlobalLockOut]:
+    """Paginated view of active 36h platform cooldowns. Sorted by soonest-expiring."""
+    now = utcnow()
+    rows, total = locks_repo.list_global_locks_paginated(
+        db, now=now, limit=page.limit, offset=page.offset
+    )
+    items = [
+        AdminGlobalLockOut(
+            company_domain=r.company_domain,
+            locked_at=r.locked_at,
+            locked_until=r.locked_until,
+            last_locked_by_user_id=r.last_locked_by_user_id,
+        )
+        for r in rows
+    ]
+    return Page(items=items, total=total, limit=page.limit, offset=page.offset)
+
+
+@router.get("/locks/platform", response_model=list[AdminPlatformLockOut])
+def list_platform_locks(
+    _admin: SuperAdminUser, db: DbDep
+) -> list[AdminPlatformLockOut]:
+    """All platform-permanent locks. Unpaginated — expected to be a small set
+    (tens, not thousands) even at scale. Add pagination when it actually hurts."""
+    rows = locks_repo.list_platform_locks(db)
+    return [
+        AdminPlatformLockOut(
+            company_domain=r.company_domain,
+            reason=r.reason,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+@router.delete("/locks/platform/{company_domain}", response_model=Ok)
+def clear_platform_lock(
+    _admin: SuperAdminUser, db: DbDep, company_domain: str
+) -> Ok:
+    """Removes the explicit-stop / manual permanent lock for a company."""
+    domain = company_domain.strip().lower()
+    was_cleared = locks_repo.clear_platform_lock(db, domain)
+    if not was_cleared:
+        raise ApiError(
+            "not_found",
+            "No platform lock found for that domain.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    db.commit()
+    log.info("admin.platform_lock_cleared", company_domain=domain)
+    return Ok()
+
+
+@router.delete("/locks/user/{user_id}/{company_domain}", response_model=Ok)
+def clear_user_company_lock(
+    _admin: SuperAdminUser, db: DbDep, user_id: int, company_domain: str
+) -> Ok:
+    """Removes a per-user reply lock manually (super_admin re-engagement override)."""
+    domain = company_domain.strip().lower()
+    was_cleared = locks_repo.clear_user_company_lock(db, user_id, domain)
+    if not was_cleared:
+        raise ApiError(
+            "not_found",
+            "No user-company lock found for that pair.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    db.commit()
+    log.info(
+        "admin.user_company_lock_cleared",
+        target_user_id=user_id,
+        company_domain=domain,
+    )
+    return Ok()
+
+
+# ─────────────────────────── contacts companies summary ───────────────────────────
 
 
 @router.get("/contacts/companies/summary", response_model=list[CompanySummaryOut])
