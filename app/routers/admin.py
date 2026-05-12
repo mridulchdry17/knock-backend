@@ -14,22 +14,30 @@ import csv
 import io
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app.core.deps import DbDep, SuperAdminUser
 from app.core.errors import ApiError
 from app.core.pagination import PaginationParams, pagination
 from app.logging_config import get_logger
+from app.repositories import contacts as contacts_repo
 from app.repositories import users as users_repo
 from app.repositories import waitlist as waitlist_repo
 from app.schemas.admin import (
+    AdminContactOut,
     AdminUserOut,
     AdminWaitlistOut,
+    CompanySummaryOut,
+    ContactUploadIn,
+    ContactUploadResultOut,
     Page,
+    RowErrorOut,
     Tier,
     TierUpdateIn,
 )
+from app.schemas.common import Ok
+from app.services import contact_upload as contact_upload_svc
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], include_in_schema=False)
 
@@ -155,3 +163,140 @@ def export_waitlist_csv(_admin: SuperAdminUser, db: DbDep) -> StreamingResponse:
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="waitlist.csv"'},
     )
+
+
+# ─────────────────────────── contacts (B5.1) ───────────────────────────
+
+
+def _result_to_out(result: contact_upload_svc.ContactUploadResult) -> ContactUploadResultOut:
+    return ContactUploadResultOut(
+        inserted=result.inserted,
+        updated=result.updated,
+        skipped=result.skipped,
+        failed=result.failed,
+        row_errors=[
+            RowErrorOut(
+                row_index=e.row_index,
+                email=e.email,
+                error_code=e.error_code,
+                message=e.message,
+            )
+            for e in result.row_errors
+        ],
+    )
+
+
+@router.post("/contacts/bulk", response_model=ContactUploadResultOut)
+def bulk_upload_contacts(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    payload: ContactUploadIn,
+) -> ContactUploadResultOut:
+    rows: list[dict[str, object]] = [dict(r) for r in payload.rows]
+    result = contact_upload_svc.bulk_upload(db, rows, dry_run=payload.dry_run)
+    if not payload.dry_run:
+        db.commit()
+    log.info(
+        "admin.contacts_bulk_upload",
+        inserted=result.inserted,
+        updated=result.updated,
+        skipped=result.skipped,
+        failed=result.failed,
+        dry_run=payload.dry_run,
+    )
+    return _result_to_out(result)
+
+
+@router.post("/contacts/bulk/csv", response_model=ContactUploadResultOut)
+async def bulk_upload_contacts_csv(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    file: Annotated[UploadFile, File(...)],
+    dry_run: Annotated[bool, Query()] = False,
+) -> ContactUploadResultOut:
+    """Multipart CSV upload. Case-insensitive column matching; hard-capped at
+    `MAX_UPLOAD_ROWS` rows (10k). For larger batches, chunk client-side."""
+    raw = await file.read()
+    try:
+        rows = contact_upload_svc.parse_csv(raw)
+    except Exception as e:
+        raise ApiError(
+            "invalid_csv",
+            f"Could not parse CSV: {e}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        ) from e
+
+    result = contact_upload_svc.bulk_upload(db, rows, dry_run=dry_run)
+    if not dry_run:
+        db.commit()
+    log.info(
+        "admin.contacts_csv_upload",
+        filename=file.filename,
+        inserted=result.inserted,
+        updated=result.updated,
+        skipped=result.skipped,
+        failed=result.failed,
+        dry_run=dry_run,
+    )
+    return _result_to_out(result)
+
+
+@router.get("/contacts", response_model=Page[AdminContactOut])
+def list_contacts(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    page: Annotated[PaginationParams, Depends(pagination)],
+    search: str | None = None,
+    company_domain: str | None = None,
+) -> Page[AdminContactOut]:
+    pairs, total = contacts_repo.list_admin_paginated(
+        db,
+        search=search,
+        company_domain=company_domain,
+        limit=page.limit,
+        offset=page.offset,
+    )
+    items = [
+        AdminContactOut(
+            id=c.id,
+            email=c.email or "",
+            name=c.name,
+            role=c.role,
+            company_id=co.id,
+            company_name=co.name,
+            company_domain=co.domain,
+            linkedin_url=c.linkedin_url,
+            source=c.email_source,
+            scraped_pattern=c.scraped_pattern,
+            is_invalid=c.is_invalid,
+            created_at=c.created_at,
+        )
+        for c, co in pairs
+    ]
+    return Page(items=items, total=total, limit=page.limit, offset=page.offset)
+
+
+@router.delete("/contacts/{contact_id}", response_model=Ok)
+def delete_contact(_admin: SuperAdminUser, db: DbDep, contact_id: int) -> Ok:
+    contact = contacts_repo.get(db, contact_id)
+    if contact is None:
+        raise ApiError("not_found", "Contact not found", status_code=status.HTTP_404_NOT_FOUND)
+    contacts_repo.delete_by_id(db, contact_id)
+    db.commit()
+    log.info("admin.contact_deleted", contact_id=contact_id)
+    return Ok()
+
+
+@router.get("/contacts/companies/summary", response_model=list[CompanySummaryOut])
+def list_companies_summary(_admin: SuperAdminUser, db: DbDep) -> list[CompanySummaryOut]:
+    """Aggregated overview for the admin UI: every company with at least one
+    contact, plus its contact count. Sorted by count desc."""
+    return [
+        CompanySummaryOut(
+            company_id=co.id,
+            company_name=co.name,
+            company_domain=co.domain,
+            contact_count=n,
+        )
+        for co, n in contacts_repo.count_by_company(db)
+    ]
