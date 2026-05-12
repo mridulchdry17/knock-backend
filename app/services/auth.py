@@ -56,29 +56,29 @@ def decide_tier_and_destination(db: OrmSession, user: User) -> TierDecision:
     """Pure-ish: reads from db (waitlist + users), but does not mutate.
 
     Decision tree (in order):
-      1. Email in SUPER_ADMIN_EMAILS → super_admin → /dashboard.
+      1. Email in SUPER_ADMIN_EMAILS → super_admin → /today.
       2. Already onboarded (waitlist_email IS NOT NULL) and tier != pending →
-         keep tier, /dashboard.
+         keep tier, /today.
       3. Already onboarded but tier == pending → still awaiting approval →
          frontend routes them to /awaiting-approval based on /onboarding/status.
       4. Not yet onboarded but OAuth email is on the waitlist → auto-claim,
-         tier='free', /dashboard.
+         tier='free', /today.
       5. Not yet onboarded and no waitlist match → leave tier='pending',
          /onboarding (frontend will offer claim-other-email or join-waitlist).
     """
     if _is_super_admin_email(user.email):
-        return TierDecision(new_tier="super_admin", next_path="/dashboard", claim_email=None)
+        return TierDecision(new_tier="super_admin", next_path="/today", claim_email=None)
 
     if user.waitlist_email is not None:
         # Returning user — keep whatever tier they already have. Do not
         # silently re-promote a pending user; admin must approve them.
         if user.tier == "pending":
             return TierDecision(new_tier="pending", next_path="/onboarding", claim_email=None)
-        return TierDecision(new_tier=user.tier, next_path="/dashboard", claim_email=None)
+        return TierDecision(new_tier=user.tier, next_path="/today", claim_email=None)
 
     # Not onboarded yet. Try waitlist auto-claim.
     if waitlist_repo.exists(db, user.email):
-        return TierDecision(new_tier="free", next_path="/dashboard", claim_email=user.email)
+        return TierDecision(new_tier="free", next_path="/today", claim_email=user.email)
 
     return TierDecision(new_tier="pending", next_path="/onboarding", claim_email=None)
 
