@@ -36,7 +36,7 @@ def test_super_admin_email_promotes(db: Session, monkeypatch) -> None:
     decision = decide_tier_and_destination(db, user)
 
     assert decision.new_tier == "super_admin"
-    assert decision.next_path == "/dashboard"
+    assert decision.next_path == "/today"
     assert decision.claim_email is None
 
 
@@ -57,7 +57,7 @@ def test_waitlist_match_auto_claims_to_free(db: Session, waitlist_email: str) ->
     decision = decide_tier_and_destination(db, user)
 
     assert decision.new_tier == "free"
-    assert decision.next_path == "/dashboard"
+    assert decision.next_path == "/today"
     assert decision.claim_email == waitlist_email
 
 
@@ -79,7 +79,7 @@ def test_returning_approved_user_keeps_tier(db: Session) -> None:
     decision = decide_tier_and_destination(db, user)
 
     assert decision.new_tier == "free"
-    assert decision.next_path == "/dashboard"
+    assert decision.next_path == "/today"
     assert decision.claim_email is None
 
 
@@ -103,7 +103,7 @@ def test_paid_returning_user_keeps_paid(db: Session) -> None:
     decision = decide_tier_and_destination(db, user)
 
     assert decision.new_tier == "paid"
-    assert decision.next_path == "/dashboard"
+    assert decision.next_path == "/today"
 
 
 # ─────────────────────────── claim_waitlist ───────────────────────────
