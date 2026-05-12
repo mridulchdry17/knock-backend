@@ -8,6 +8,7 @@ from app.models.platform_company_lock import PlatformCompanyLock
 from app.models.send_queue import SendQueue
 from app.models.session import Session
 from app.models.template import Template
+from app.models.today_batch_item import TodayBatchItem
 from app.models.user import User
 from app.models.user_company_lock import UserCompanyLock
 from app.models.user_contact_map import UserContactMap
@@ -25,6 +26,7 @@ __all__ = [
     "SendQueue",
     "Session",
     "Template",
+    "TodayBatchItem",
     "User",
     "UserCompanyLock",
     "UserContactMap",

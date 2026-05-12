@@ -40,6 +40,7 @@ from app.models import (  # noqa: F401
     PlatformCompanyLock,
     SendQueue,
     Template,
+    TodayBatchItem,
     User,
     UserCompanyLock,
     UserContactMap,
