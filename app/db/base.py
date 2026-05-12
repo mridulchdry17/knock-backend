@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
@@ -85,6 +86,16 @@ def _build_engine() -> Engine:
         # at the connection level; the ORM Session still groups writes via flush+commit, and
         # the underlying connection autocommits them on dispatch.
         engine_kwargs["isolation_level"] = "AUTOCOMMIT"
+
+        # Hrana streams are stateful and TTL-expire after idle periods. Reusing a
+        # stale connection from a pool yields:
+        #   ValueError: Hrana: api error: status=404 ...
+        #     {"error":"stream not found: <id>"}
+        # pool_pre_ping doesn't catch this for libsql (the ping itself runs over
+        # a stream that's already dead). NullPool issues a fresh connection on
+        # every checkout — cheap at v0 traffic, eliminates the failure mode.
+        engine_kwargs["poolclass"] = NullPool
+        engine_kwargs.pop("pool_pre_ping", None)
 
     eng = create_engine(url, **engine_kwargs)
 

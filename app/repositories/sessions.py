@@ -3,14 +3,14 @@ from __future__ import annotations
 from sqlalchemy import delete
 from sqlalchemy.orm import Session as OrmSession
 
-from app.core.time import utcnow
+from app.core.time import ensure_utc, utcnow
 from app.models import Session as SessionRow
 
 
 def get_active(db: OrmSession, token: str) -> SessionRow | None:
     """Return the session iff it exists and has not expired."""
     row = db.get(SessionRow, token)
-    if row is None or row.expires_at <= utcnow():
+    if row is None or ensure_utc(row.expires_at) <= utcnow():
         return None
     return row
 

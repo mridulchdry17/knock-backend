@@ -11,7 +11,7 @@ class OnboardingStatusOut(ORMModel):
     """GET /api/v1/onboarding/status — frontend reads this for the auth-guard
     routing decision.
 
-      - tier='super_admin'/'paid'/'free' → /dashboard
+      - tier='super_admin'/'paid'/'free' → /today
       - tier='pending' AND onboarded=False → /onboarding
       - tier='pending' AND onboarded=True → /awaiting-approval
     """
