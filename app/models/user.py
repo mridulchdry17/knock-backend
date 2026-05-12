@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.config import settings
@@ -40,6 +40,29 @@ class User(Base, TimestampMixin):
     waitlist_email: Mapped[str | None] = mapped_column(String(255), unique=True)
     tier: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     tier_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # B5.2 preferences. Free-text targeting metadata is collected here but not
+    # yet read by the v0 batch picker — locked product decision per
+    # project_targeting_model.md. `target_industries` is a JSON-encoded list[str];
+    # serialize/deserialize at the Pydantic boundary.
+    target_role: Mapped[str | None] = mapped_column(String(255))
+    target_industries: Mapped[str | None] = mapped_column(Text)
+    target_location: Mapped[str | None] = mapped_column(String(255))
+
+    notify_gmail_disconnect: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    notify_daily_summary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+
+    autopilot_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    autopilot_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    autopilot_auto_pause_on_reply: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+
+    resume_url: Mapped[str | None] = mapped_column(String(2048))
 
     @property
     def has_gmail_connected(self) -> bool:
