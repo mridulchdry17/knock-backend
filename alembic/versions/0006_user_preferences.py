@@ -1,8 +1,13 @@
 """user_preferences: target metadata + notification toggles + autopilot + excluded domains
 
-Revision ID: 0005_user_preferences
-Revises: 0004_drop_is_admin
+Revision ID: 0006_user_preferences
+Revises: 0005_contacts_scraped_pattern
 Create Date: 2026-05-12
+
+Renumbered 0005 → 0006 to coexist with B5.1's `0005_contacts_scraped_pattern`.
+Both branches initially numbered 0005 because they were developed against the
+same `pre-release` HEAD (`0004_drop_is_admin`). B5.1 lands first; this migration
+now chains off it.
 
 Backs the `/api/v1/preferences` endpoints (B5.2). Two surfaces:
 
@@ -32,8 +37,8 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "0005_user_preferences"
-down_revision: str | Sequence[str] | None = "0004_drop_is_admin"
+revision: str = "0006_user_preferences"
+down_revision: str | Sequence[str] | None = "0005_contacts_scraped_pattern"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
