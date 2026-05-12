@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -26,6 +26,15 @@ class Contact(Base, CreatedAtMixin):
     # (e.g. "firstname.lastname"). Used by B5.5 to try an alternate pattern on
     # bounce.
     scraped_pattern: Mapped[str | None] = mapped_column(String(64))
+    # Admin/scraper-curated notes shared across ALL users who see this contact
+    # ("former IIT-B, MS Stanford"). Read-only for regular users; admin writes
+    # via the CSV upload service. Distinct from per-user observations stored
+    # in `user_contact_notes`.
+    notes: Mapped[str | None] = mapped_column(Text)
+    # Operational provenance of the contact row (linkedin-scrape, 2026-iit-fair,
+    # referral-aman, manual-research). Distinct from `email_source` which
+    # describes the email-discovery mechanism (manual|hunter|guess).
+    source: Mapped[str | None] = mapped_column(String(64))
 
     __table_args__ = (
         UniqueConstraint("email", name="uq_contacts_email"),

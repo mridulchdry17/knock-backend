@@ -82,10 +82,23 @@ class _ParsedRow:
 
 
 def _clean(value: object) -> str | None:
-    """Whitespace+trailing-punct strip. Returns None for empty/whitespace-only."""
+    """Whitespace+trailing-punct strip. Returns None for empty/whitespace-only.
+
+    Used for short structured fields (names, roles, company labels) where the
+    dump-style trailing comma/period is noise. NOT for freeform notes — those
+    legitimately end with sentence punctuation.
+    """
     if value is None:
         return None
     s = str(value).strip().strip(_TRAILING_PUNCT).strip()
+    return s or None
+
+
+def _clean_freeform(value: object) -> str | None:
+    """Whitespace-only strip; preserves trailing punctuation. For `notes`."""
+    if value is None:
+        return None
+    s = str(value).strip()
     return s or None
 
 
@@ -170,7 +183,7 @@ def _parse_row(row_index: int, raw: dict[str, object]) -> _ParsedRow | RowError:
         company_domain=company_domain,
         linkedin_url=_clean(canonical.get("linkedin_url")),
         source=_clean(canonical.get("source")),
-        notes=_clean(canonical.get("notes")),
+        notes=_clean_freeform(canonical.get("notes")),
         scraped_pattern=_clean(canonical.get("scraped_pattern")),
     )
 
@@ -251,14 +264,17 @@ def bulk_upload(
                     role=p.role,
                     email=p.email,
                     linkedin_url=p.linkedin_url,
-                    email_source=p.source,
+                    source=p.source,
+                    notes=p.notes,
                     scraped_pattern=p.scraped_pattern,
                 )
                 contacts_repo.add(db, contact)
                 inserted += 1
             else:
                 # Selective update — only overwrite fields the upload actually
-                # carries. Preserves manual admin edits to other columns.
+                # carries. Preserves manual admin edits to other columns:
+                # re-uploading a CSV row without notes/source does NOT clobber
+                # prior admin curation.
                 changed = False
                 if p.name and current.name != p.name:
                     current.name = p.name
@@ -269,8 +285,11 @@ def bulk_upload(
                 if p.linkedin_url and current.linkedin_url != p.linkedin_url:
                     current.linkedin_url = p.linkedin_url
                     changed = True
-                if p.source and current.email_source != p.source:
-                    current.email_source = p.source
+                if p.source and current.source != p.source:
+                    current.source = p.source
+                    changed = True
+                if p.notes and current.notes != p.notes:
+                    current.notes = p.notes
                     changed = True
                 if p.scraped_pattern and current.scraped_pattern != p.scraped_pattern:
                     current.scraped_pattern = p.scraped_pattern
