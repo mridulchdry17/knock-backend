@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.core.errors import register_error_handlers
-from app.logging import configure_logging, get_logger
+from app.logging_config import configure_logging, get_logger
 from app.routers import register as register_routers
 
 

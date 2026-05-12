@@ -26,8 +26,11 @@ from fastapi.responses import RedirectResponse
 
 from app.config import settings
 from app.core.cookies import (
+    OAUTH_CODE_VERIFIER_COOKIE,
     OAUTH_STATE_COOKIE,
+    clear_oauth_code_verifier_cookie,
     clear_oauth_state_cookie,
+    set_oauth_code_verifier_cookie,
     set_oauth_state_cookie,
 )
 from app.core.crypto import decrypt_optional
@@ -75,12 +78,13 @@ def _frontend_redirect_with_token(path: str, token: str, **params: str) -> Redir
 @bootstrap.get("/login")
 def login() -> RedirectResponse:
     try:
-        auth_url, state = build_authorization_url(settings.GOOGLE_REDIRECT_URI)
+        auth_url, state, code_verifier = build_authorization_url(settings.GOOGLE_REDIRECT_URI)
     except OAuthError as e:
         return _frontend_redirect("/connect", error=str(e))
 
     resp = RedirectResponse(url=auth_url, status_code=status.HTTP_302_FOUND)
     set_oauth_state_cookie(resp, state)
+    set_oauth_code_verifier_cookie(resp, code_verifier)
     return resp
 
 
@@ -91,15 +95,19 @@ def google_callback(
     code: str = Query(...),
     state: str = Query(...),
     state_cookie: str | None = Cookie(default=None, alias=OAUTH_STATE_COOKIE),
+    code_verifier_cookie: str | None = Cookie(default=None, alias=OAUTH_CODE_VERIFIER_COOKIE),
 ) -> RedirectResponse:
     if not state_cookie or state_cookie != state:
         return _frontend_redirect("/connect", error="state_mismatch")
 
     try:
-        identity = exchange_code(code, state, settings.GOOGLE_REDIRECT_URI)
+        identity = exchange_code(
+            code, state, settings.GOOGLE_REDIRECT_URI, code_verifier=code_verifier_cookie
+        )
     except OAuthError as e:
         resp = _frontend_redirect("/connect", error=str(e))
         clear_oauth_state_cookie(resp)
+        clear_oauth_code_verifier_cookie(resp)
         return resp
 
     _user, session, decision = auth_service.complete_google_login(
@@ -111,6 +119,7 @@ def google_callback(
 
     resp = _frontend_redirect_with_token("/auth/complete", session.id, next=decision.next_path)
     clear_oauth_state_cookie(resp)
+    clear_oauth_code_verifier_cookie(resp)
     return resp
 
 

@@ -19,7 +19,7 @@ from fastapi import APIRouter, status
 
 from app.core.deps import CurrentUser, DbDep
 from app.core.errors import ApiError
-from app.logging import get_logger
+from app.logging_config import get_logger
 from app.schemas.onboarding import (
     AwaitingApprovalOut,
     ClaimWaitlistIn,
