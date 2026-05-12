@@ -17,7 +17,6 @@ class Contact(Base, CreatedAtMixin):
     name: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[str | None] = mapped_column(String(128))
     email: Mapped[str | None] = mapped_column(String(255), index=True)
-    email_source: Mapped[str | None] = mapped_column(String(16))  # 'guess'|'hunter'|'manual'
     email_confidence: Mapped[int | None] = mapped_column(Integer)
     email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_invalid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -31,9 +30,11 @@ class Contact(Base, CreatedAtMixin):
     # via the CSV upload service. Distinct from per-user observations stored
     # in `user_contact_notes`.
     notes: Mapped[str | None] = mapped_column(Text)
-    # Operational provenance of the contact row (linkedin-scrape, 2026-iit-fair,
-    # referral-aman, manual-research). Distinct from `email_source` which
-    # describes the email-discovery mechanism (manual|hunter|guess).
+    # Provenance of the contact row — both "where we found the person" and "how
+    # we got the email" collapsed into one field (the v0 admin-upload pattern
+    # always produces the same value for both). Examples: linkedin-scrape,
+    # 2026-iit-fair, referral-aman, manual-research, hunter-api. If a future
+    # scraper needs to differentiate the two, re-split with a new migration.
     source: Mapped[str | None] = mapped_column(String(64))
 
     __table_args__ = (
