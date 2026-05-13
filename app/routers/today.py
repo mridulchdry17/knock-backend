@@ -23,6 +23,7 @@ from app.schemas.today import (
     TodayItemOut,
     UpdateItemIn,
 )
+from app.services import batch_generator as batch_gen_svc
 
 router = APIRouter(
     prefix="/api/v1/today",
@@ -150,15 +151,43 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
 def get_today(user: CurrentUser, db: DbDep) -> TodayBatchOut:
     """Returns today's batch for the authenticated user.
 
-    404 with code='no_batch_yet' if the cron hasn't generated a batch yet —
-    frontend renders the empty state ("Today's picks land at 6 AM").
+    Lazy generation: if no batch exists yet for today, run the picker inline
+    for this user only and return the freshly-generated cards. This is the
+    v0 substitute for a scheduled cron — first GET of the day pays a
+    sub-second latency cost, every subsequent GET is fast (idempotency guards
+    in the generator prevent re-runs).
+
+    404 with code='no_batch_yet' if the inline generation produced zero items
+    (suspended, gmail_disconnected, pending tier, or no eligible contacts).
+    Frontend renders the appropriate empty state.
     """
     today = utcnow().date()
     items = today_repo.list_for_user_date(db, user.id, today)
+
+    if not items:
+        # No batch yet — generate one for this user inline. The generator is
+        # idempotent (DB UNIQUE + has_batch_for_date guard) so a concurrent
+        # request from the same user is safe.
+        # `db.merge` ensures the user is bound to the request's session — a
+        # no-op in production (user already came from this session via
+        # get_current_user) but necessary when test fixtures inject a User
+        # owned by a different session.
+        user_in_session = db.merge(user, load=False)
+        gen_result = batch_gen_svc.generate_batch_for_user(
+            db, user_in_session, batch_date=today
+        )
+        log.info(
+            "today.lazy_generated",
+            user_id=user.id,
+            items_created=gen_result.items_created,
+            reason_if_skipped=gen_result.reason_if_skipped,
+        )
+        items = today_repo.list_for_user_date(db, user.id, today)
+
     if not items:
         raise ApiError(
             "no_batch_yet",
-            "Today's batch hasn't been generated yet. Check back at 6 AM.",
+            "No batch available today — try again later or check your preferences.",
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
