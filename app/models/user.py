@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.config import settings
@@ -41,6 +41,12 @@ class User(Base, TimestampMixin):
     gmail_disconnected: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    # B5.6 reply ingestion watermark. Gmail History API ids are 64-bit unsigned
+    # integers; we use BigInteger to be safe. NULL means "not bootstrapped yet" —
+    # the first ingest run reads the latest historyId from users.getProfile
+    # and stores it WITHOUT fetching messages (bootstrap), so the next run
+    # only sees genuinely-new history events.
+    gmail_history_id: Mapped[int | None] = mapped_column(BigInteger)
 
     # Phase 4 soft-gate + tier model. See memory.md log entries 2026-05-05.
     waitlist_email: Mapped[str | None] = mapped_column(String(255), unique=True)

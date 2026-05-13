@@ -123,3 +123,17 @@ class AdminUserCompanyLockOut(BaseModel):
     locked_until: datetime
     is_permanent: bool
     reason: str
+
+
+# ─────────────────────────── reply ingest (B5.6) ───────────────────────────
+
+
+class IngestSummaryOut(BaseModel):
+    """One user's reply ingest summary (admin endpoint response item)."""
+
+    user_id: int
+    processed: int
+    replies_matched: int
+    explicit_stops: int
+    user_reply_locks_written: int
+    error_kind: str | None = None

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -60,6 +60,12 @@ class SendQueue(Base, CreatedAtMixin):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String(1024))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # B5.6 reply ingestion. `replied_at` mirrors Gmail's internal_date on the
+    # matched inbound message (NOT the cron run time), so the Inbox surfaces
+    # the true reply timestamp.
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reply_is_explicit_stop: Mapped[bool | None] = mapped_column(Boolean)
 
     __table_args__ = (
         Index("idx_queue_due", "status", "scheduled_for"),

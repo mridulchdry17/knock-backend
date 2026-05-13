@@ -37,6 +37,7 @@ from app.schemas.admin import (
     CompanySummaryOut,
     ContactUploadIn,
     ContactUploadResultOut,
+    IngestSummaryOut,
     Page,
     RowErrorOut,
     Tier,
@@ -50,6 +51,7 @@ from app.schemas.today import (
 )
 from app.services import batch_generator as batch_gen_svc
 from app.services import contact_upload as contact_upload_svc
+from app.services import reply_ingestor as reply_ingestor_svc
 from app.services import send_worker as send_worker_svc
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], include_in_schema=False)
@@ -513,6 +515,54 @@ def failures_summary(_admin: SuperAdminUser, db: DbDep) -> FailureSummaryOut:
         last_24h=failures_repo.count_by_kind(db, since=now - timedelta(hours=24)),
         last_7d=failures_repo.count_by_kind(db, since=now - timedelta(days=7)),
     )
+
+
+# ─────────────────────────── reply ingestion (B5.6) ───────────────────────────
+
+
+@router.post("/replies/ingest", response_model=list[IngestSummaryOut])
+def trigger_reply_ingest(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    target_user_id: int | None = None,
+) -> list[IngestSummaryOut]:
+    """Manually run the Gmail reply ingestor across all users (or one).
+
+    No scheduler is wired in v0; this endpoint plus `python -m
+    app.jobs.reply_ingest_cron` are the only ways to run ingest. The
+    response is the list of per-user summaries so the admin UI can show
+    explicit-stop counts and any auth-revoked users in one shot.
+    """
+    if target_user_id is not None:
+        user = users_repo.get(db, target_user_id)
+        if user is None:
+            raise ApiError(
+                "not_found",
+                "User not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        summaries = [reply_ingestor_svc.ingest_replies_for_user(db, user)]
+    else:
+        summaries = reply_ingestor_svc.ingest_replies_for_all_users(db)
+
+    log.info(
+        "admin.replies_ingest",
+        target_user_id=target_user_id,
+        users_processed=len(summaries),
+        total_replies_matched=sum(s.replies_matched for s in summaries),
+        total_explicit_stops=sum(s.explicit_stops for s in summaries),
+    )
+    return [
+        IngestSummaryOut(
+            user_id=s.user_id,
+            processed=s.processed,
+            replies_matched=s.replies_matched,
+            explicit_stops=s.explicit_stops,
+            user_reply_locks_written=s.user_reply_locks_written,
+            error_kind=s.error_kind,
+        )
+        for s in summaries
+    ]
 
 
 # ─────────────────────────── contacts companies summary ───────────────────────────
