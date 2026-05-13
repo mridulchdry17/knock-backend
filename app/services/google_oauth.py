@@ -1,6 +1,8 @@
 """Google OAuth 2.0 flow — strictly the auth handshake.
 
-Gmail API send/read lives in services/gmail.py (added in a later phase).
+Gmail send adapter lives in services/gmail_send.py (B5.5). This module also
+owns the credentials lookup (`get_user_credentials`) used by the send worker —
+it's the cleanest home since we already encrypt/decrypt tokens here.
 """
 from __future__ import annotations
 
@@ -10,9 +12,12 @@ from datetime import UTC, datetime
 
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
 from app.config import settings
+from app.core.crypto import decrypt_optional
+from app.models import User
 
 SCOPES: list[str] = [
     "openid",
@@ -138,6 +143,32 @@ def exchange_code(
         access_token=creds.token,
         token_expiry=expiry,
         granted_scopes=granted,
+    )
+
+
+def get_user_credentials(user: User) -> Credentials:
+    """Build a google.oauth2 Credentials object from the user's stored tokens.
+
+    Decrypts refresh + access tokens via Fernet and constructs a Credentials
+    object the Gmail API client can use directly. google-auth handles refresh
+    automatically when an access_token is expired — but we don't persist the
+    refreshed token back here in v0 (B5.5 doesn't need that — Credentials.refresh()
+    mutates the in-memory object and Gmail calls just work). When B5.6 ships
+    long-lived workers, lift the post-refresh persist into a service helper.
+    """
+    refresh_token = decrypt_optional(user.google_refresh_token)
+    if not refresh_token:
+        raise OAuthError("missing_refresh_token")
+
+    access_token = decrypt_optional(user.google_access_token)
+
+    return Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.GOOGLE_CLIENT_ID,
+        client_secret=settings.GOOGLE_CLIENT_SECRET,
+        scopes=list(SCOPES),
     )
 
 

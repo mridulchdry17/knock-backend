@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -23,6 +24,7 @@ from app.core.pagination import PaginationParams, pagination
 from app.core.time import utcnow
 from app.logging_config import get_logger
 from app.repositories import contacts as contacts_repo
+from app.repositories import email_failures as failures_repo
 from app.repositories import locks as locks_repo
 from app.repositories import users as users_repo
 from app.repositories import waitlist as waitlist_repo
@@ -41,12 +43,14 @@ from app.schemas.admin import (
     TierUpdateIn,
 )
 from app.schemas.common import Ok
+from app.schemas.failures import DrainSummaryOut, FailureOut, FailureSummaryOut
 from app.schemas.today import (
     AdminCronRunResultItemOut,
     AdminCronRunResultOut,
 )
 from app.services import batch_generator as batch_gen_svc
 from app.services import contact_upload as contact_upload_svc
+from app.services import send_worker as send_worker_svc
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], include_in_schema=False)
 
@@ -432,6 +436,82 @@ def run_today_cron_now(
         ],
         total_items_created=total_created,
         total_users_processed=len(results),
+    )
+
+
+# ─────────────────────────── send worker + failures (B5.5) ───────────────────────────
+
+
+@router.post("/send/drain", response_model=DrainSummaryOut)
+def trigger_send_drain(_admin: SuperAdminUser, db: DbDep) -> DrainSummaryOut:
+    """Manually fires the Gmail send worker against all due today_batch_items.
+
+    Used by Mridul in dev + the launch ceremony before an APScheduler hookup
+    exists. Each item commits independently — a partial run still makes progress.
+    """
+    summary = send_worker_svc.drain_due_items(db)
+    log.info(
+        "admin.send_drain",
+        attempted=summary.attempted,
+        sent=summary.sent,
+        failed=summary.failed,
+        skipped=summary.skipped,
+    )
+    return DrainSummaryOut(
+        attempted=summary.attempted,
+        sent=summary.sent,
+        failed=summary.failed,
+        skipped=summary.skipped,
+        failures_by_kind=summary.failures_by_kind,
+    )
+
+
+@router.get("/failures", response_model=Page[FailureOut])
+def list_failures(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    page: Annotated[PaginationParams, Depends(pagination)],
+    user_id: int | None = None,
+    kind: str | None = None,
+) -> Page[FailureOut]:
+    """Newest-first listing of email_failures, paginated. Filters: user_id, kind."""
+    rows, total = failures_repo.list_recent(
+        db,
+        limit=page.limit,
+        offset=page.offset,
+        user_id=user_id,
+        failure_kind=kind,
+    )
+    # Resolve emails in one batched lookup — most pages will have a handful of
+    # distinct user_ids.
+    user_ids = {r.user_id for r in rows}
+    users_by_id = {
+        u.id: u for u in (users_repo.get(db, uid) for uid in user_ids) if u is not None
+    }
+    items = [
+        FailureOut(
+            id=r.id,
+            user_id=r.user_id,
+            user_email=(users_by_id.get(r.user_id).email if r.user_id in users_by_id else ""),
+            today_batch_item_id=r.today_batch_item_id,
+            company_domain=r.company_domain,
+            failure_kind=r.failure_kind,
+            error_message=r.error_message,
+            gmail_error_code=r.gmail_error_code,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+    return Page(items=items, total=total, limit=page.limit, offset=page.offset)
+
+
+@router.get("/failures/summary", response_model=FailureSummaryOut)
+def failures_summary(_admin: SuperAdminUser, db: DbDep) -> FailureSummaryOut:
+    """Failure counts grouped by `failure_kind` for the last 24h and last 7d."""
+    now = utcnow()
+    return FailureSummaryOut(
+        last_24h=failures_repo.count_by_kind(db, since=now - timedelta(hours=24)),
+        last_7d=failures_repo.count_by_kind(db, since=now - timedelta(days=7)),
     )
 
 

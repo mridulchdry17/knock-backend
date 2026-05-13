@@ -2,6 +2,7 @@
 from app.models.campaign import Campaign
 from app.models.company import Company
 from app.models.contact import Contact
+from app.models.email_failure import EmailFailure
 from app.models.email_log import EmailLog
 from app.models.global_lock import GlobalContactLock
 from app.models.platform_company_lock import PlatformCompanyLock
@@ -20,6 +21,7 @@ __all__ = [
     "Campaign",
     "Company",
     "Contact",
+    "EmailFailure",
     "EmailLog",
     "GlobalContactLock",
     "PlatformCompanyLock",

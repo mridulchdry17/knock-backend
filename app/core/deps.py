@@ -9,9 +9,12 @@ from sqlalchemy.orm import Session as OrmSession
 
 from app.core.errors import ApiError
 from app.db.session import get_db
+from app.logging_config import get_logger
 from app.models import User
 from app.repositories import sessions as sessions_repo
 from app.repositories import users as users_repo
+
+log = get_logger("deps")
 
 DbDep = Annotated[OrmSession, Depends(get_db)]
 
@@ -63,8 +66,15 @@ def get_current_user(
             "account_suspended", "Account is suspended", status_code=status.HTTP_403_FORBIDDEN
         )
 
-    sessions_repo.touch(db, session)
-    db.commit()
+    # Last-seen update is best-effort. Turso's Hrana protocol expires idle streams
+    # aggressively; if the touch/commit hits a stale stream we don't want to fail
+    # the whole request — that just means last_seen_at lags by one hit.
+    try:
+        sessions_repo.touch(db, session)
+        db.commit()
+    except Exception as exc:  # pragma: no cover — Turso transport flake
+        log.warning("session.touch_failed", error=str(exc), session_id=session.id)
+        db.rollback()
     return user
 
 
