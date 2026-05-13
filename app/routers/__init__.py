@@ -5,6 +5,7 @@ from app.routers import (
     auth,
     contacts,
     health,
+    inbox,
     onboarding,
     preferences,
     today,
@@ -22,3 +23,4 @@ def register(app: FastAPI) -> None:
     app.include_router(preferences.router)
     app.include_router(contacts.router)
     app.include_router(today.router)
+    app.include_router(inbox.router)
