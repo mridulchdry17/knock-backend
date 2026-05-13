@@ -35,6 +35,12 @@ class User(Base, TimestampMixin):
     sender_signature_city: Mapped[str | None] = mapped_column(String(255))
 
     is_suspended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Flipped True by the send worker (B5.5) when Gmail returns
+    # invalid_grant / failedPrecondition. Frontend surfaces a "Reconnect Gmail"
+    # CTA when this is True. Reset to False on a successful OAuth re-link.
+    gmail_disconnected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     # Phase 4 soft-gate + tier model. See memory.md log entries 2026-05-05.
     waitlist_email: Mapped[str | None] = mapped_column(String(255), unique=True)

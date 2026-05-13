@@ -35,6 +35,7 @@ from app.models import (  # noqa: F401
     Campaign,
     Company,
     Contact,
+    EmailFailure,
     EmailLog,
     GlobalContactLock,
     PlatformCompanyLock,
