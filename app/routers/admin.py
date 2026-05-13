@@ -581,3 +581,39 @@ def list_companies_summary(_admin: SuperAdminUser, db: DbDep) -> list[CompanySum
         )
         for co, n in contacts_repo.count_by_company(db)
     ]
+
+
+# ─────────────────────────── autopilot cycle (B5.7) ───────────────────────────
+
+
+@router.post("/autopilot/cycle")
+def trigger_autopilot_cycle(_admin: SuperAdminUser) -> dict:
+    """Manually run the full Phase-5 daily cycle: batch_gen → send → ingest.
+
+    Idempotent at each stage. Used by Mridul to fire the autopilot end-to-end
+    in dev / during the v0 launch ceremony, before a real scheduler is wired.
+    The session is closed/reopened inside `run_cycle` to mirror cron semantics.
+    Returns the structured cycle summary.
+    """
+    from app.jobs.autopilot_cycle_cron import run_cycle
+
+    result = run_cycle()
+    log.info(
+        "admin.autopilot_cycle_run",
+        batch_users=result.batch_users_processed,
+        batch_items=result.batch_items_created,
+        sent=result.sent,
+        failed=result.failed,
+        replies_matched=result.replies_matched,
+        explicit_stops=result.explicit_stops,
+    )
+    return {
+        "batch_users_processed": result.batch_users_processed,
+        "batch_items_created": result.batch_items_created,
+        "sent": result.sent,
+        "failed": result.failed,
+        "skipped_sends": result.skipped_sends,
+        "ingest_users_processed": result.ingest_users_processed,
+        "replies_matched": result.replies_matched,
+        "explicit_stops": result.explicit_stops,
+    }

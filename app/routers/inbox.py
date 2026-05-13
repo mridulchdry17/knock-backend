@@ -19,7 +19,7 @@ from app.core.pagination import PaginationParams, pagination
 from app.logging_config import get_logger
 from app.models import Company, Contact, SendQueue
 from app.schemas.admin import Page
-from app.schemas.inbox import InboxItemOut
+from app.schemas.inbox import InboxItemOut, InboxSyncStatusOut
 from app.services import locks as locks_svc
 
 router = APIRouter(
@@ -112,3 +112,25 @@ def list_replies(
         )
 
     return Page(items=items, total=total, limit=page.limit, offset=page.offset)
+
+
+@router.get("/sync-status", response_model=InboxSyncStatusOut)
+def get_sync_status(user: CurrentUser, db: DbDep) -> InboxSyncStatusOut:
+    """Powers the "synced X mins ago" indicator on the inbox.
+
+    v0: `last_synced_at` is derived from the most recent `replied_at` we've
+    recorded for this user — there's no separate "last ingest run completed"
+    column yet. That makes the indicator accurate when replies are flowing and
+    null on a quiet day; either is acceptable for the launch UX.
+
+    `syncing` is always False in v0 — single-process worker, no concurrent
+    ingest. Reserved for v1 when async background ingest lands.
+    """
+    last_replied = db.scalar(
+        select(SendQueue.replied_at)
+        .where(SendQueue.user_id == user.id)
+        .where(SendQueue.status == "REPLIED")
+        .order_by(desc(SendQueue.replied_at))
+        .limit(1)
+    )
+    return InboxSyncStatusOut(last_synced_at=last_replied, syncing=False)

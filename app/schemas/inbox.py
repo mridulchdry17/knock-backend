@@ -35,3 +35,17 @@ class InboxListOut(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class InboxSyncStatusOut(BaseModel):
+    """Surface for the "last synced X mins ago" indicator on the inbox.
+
+    `last_synced_at` reflects when the user's `gmail_history_id` was last
+    advanced (i.e. an ingest run completed for them). Null on first load
+    before any ingest has happened — frontend shows "never synced".
+    `syncing` is always False in v0 (single-process, no concurrent ingest);
+    placeholder for v1 when we add background async ingest.
+    """
+
+    last_synced_at: datetime | None
+    syncing: bool
