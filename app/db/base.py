@@ -97,6 +97,14 @@ def _build_engine() -> Engine:
         engine_kwargs["poolclass"] = NullPool
         engine_kwargs.pop("pool_pre_ping", None)
 
+        # Suppress the connection-return ROLLBACK. With AUTOCOMMIT isolation
+        # there is nothing to roll back; the dialect issues a `rollback()` on
+        # session close anyway, which then trips a fresh Hrana stream lookup
+        # on an already-dead stream and noisily 404s in the logs (see "Exception
+        # during reset or similar"). Skipping reset is safe on NullPool because
+        # the connection is disposed, not recycled.
+        engine_kwargs["pool_reset_on_return"] = None
+
     eng = create_engine(url, **engine_kwargs)
 
     if _is_local_sqlite(settings.DATABASE_URL):
