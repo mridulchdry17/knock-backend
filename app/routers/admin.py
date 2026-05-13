@@ -41,6 +41,11 @@ from app.schemas.admin import (
     TierUpdateIn,
 )
 from app.schemas.common import Ok
+from app.schemas.today import (
+    AdminCronRunResultItemOut,
+    AdminCronRunResultOut,
+)
+from app.services import batch_generator as batch_gen_svc
 from app.services import contact_upload as contact_upload_svc
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], include_in_schema=False)
@@ -373,6 +378,61 @@ def clear_user_company_lock(
         company_domain=domain,
     )
     return Ok()
+
+
+# ─────────────────────────── today batch cron (B5.4) ───────────────────────────
+
+
+@router.post("/today/run-cron", response_model=AdminCronRunResultOut)
+def run_today_cron_now(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    target_user_id: int | None = None,
+) -> AdminCronRunResultOut:
+    """Manually trigger the B5.4 batch cron — generate today's picks for all
+    eligible users, or just one user if `target_user_id` is set.
+
+    The scheduled cron isn't wired up in v0; this endpoint is how we exercise
+    batch generation in dev and during the launch ceremony. Swap-point: a
+    systemd timer or APScheduler running `run_batch_cron` will replace this
+    once the daily flow is observed working end-to-end.
+    """
+    today = utcnow().date()
+
+    if target_user_id is not None:
+        user = users_repo.get(db, target_user_id)
+        if user is None:
+            raise ApiError(
+                "not_found",
+                "User not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        results = [batch_gen_svc.generate_batch_for_user(db, user, batch_date=today)]
+    else:
+        results = batch_gen_svc.generate_batch_for_all_users(db, batch_date=today)
+
+    total_created = sum(r.items_created for r in results)
+    log.info(
+        "admin.today_cron_run",
+        target_user_id=target_user_id,
+        users_processed=len(results),
+        total_items_created=total_created,
+    )
+
+    return AdminCronRunResultOut(
+        batch_date=today,
+        results=[
+            AdminCronRunResultItemOut(
+                user_id=r.user_id,
+                items_created=r.items_created,
+                items_skipped=r.items_skipped,
+                reason_if_skipped=r.reason_if_skipped,
+            )
+            for r in results
+        ],
+        total_items_created=total_created,
+        total_users_processed=len(results),
+    )
 
 
 # ─────────────────────────── contacts companies summary ───────────────────────────
