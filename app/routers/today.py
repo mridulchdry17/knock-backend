@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, status
 
 from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
-from app.core.time import utcnow
+from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
 from app.models import Company, Contact, TodayBatchItem
 from app.repositories import today_batch as today_repo
@@ -102,7 +102,11 @@ def _item_to_out(
         subject=item.subject,
         body_preview=_body_preview(item.body),
         body=item.body,
-        send_time=item.send_time,
+        # libsql/SQLite strips tzinfo on storage, so item.send_time comes back
+        # naive even though we wrote it tz-aware. Re-attach UTC at the boundary
+        # so the JSON contract always has an offset — Zod/strict client schemas
+        # reject naive datetime strings.
+        send_time=ensure_utc(item.send_time),
         status=item.status,  # type: ignore[arg-type]
         cooldown_until=None,
         sent_at=None,
@@ -192,8 +196,8 @@ def get_today(user: CurrentUser, db: DbDep) -> TodayBatchOut:
         )
 
     # generated_at: earliest created_at of the batch rows — this IS the cron
-    # run time for this user.
-    generated_at = min(item.created_at for item in items)
+    # run time for this user. Coerce to UTC since libsql returns naive datetimes.
+    generated_at = ensure_utc(min(item.created_at for item in items))
 
     return TodayBatchOut(
         generated_at=generated_at,

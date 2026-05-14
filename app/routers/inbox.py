@@ -16,6 +16,7 @@ from sqlalchemy import desc, func, select
 
 from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.pagination import PaginationParams, pagination
+from app.core.time import ensure_utc
 from app.logging_config import get_logger
 from app.models import Company, Contact, SendQueue
 from app.schemas.admin import Page
@@ -104,10 +105,11 @@ def list_replies(
                 company_name=(company.name if company else ""),
                 company_domain=r.company_domain or "",
                 subject=r.subject or "",
-                replied_at=r.replied_at,  # always present when status='REPLIED'
+                # libsql strips tzinfo on storage — re-attach UTC at the boundary.
+                replied_at=ensure_utc(r.replied_at),  # always present when status='REPLIED'
                 reply_is_explicit_stop=bool(r.reply_is_explicit_stop),
                 lock_status=avail.status.value,
-                locked_until=avail.unlocked_at,
+                locked_until=ensure_utc(avail.unlocked_at) if avail.unlocked_at else None,
             )
         )
 
@@ -133,4 +135,7 @@ def get_sync_status(user: CurrentUser, db: DbDep) -> InboxSyncStatusOut:
         .order_by(desc(SendQueue.replied_at))
         .limit(1)
     )
-    return InboxSyncStatusOut(last_synced_at=last_replied, syncing=False)
+    return InboxSyncStatusOut(
+        last_synced_at=ensure_utc(last_replied) if last_replied else None,
+        syncing=False,
+    )
