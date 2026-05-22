@@ -23,6 +23,7 @@ from enum import StrEnum
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.time import ensure_utc, utcnow
+from app.models import GlobalContactLock, PlatformCompanyLock, UserCompanyLock
 from app.repositories import locks as locks_repo
 
 # Default lock durations — kept here (not in config) so they live alongside
@@ -53,19 +54,20 @@ def _normalize_domain(domain: str) -> str:
     return domain.strip().lower()
 
 
-def check_can_send_to_company(
-    db: OrmSession, *, user_id: int, company_domain: str
+def _resolve_lock_state(
+    *,
+    now: datetime,
+    platform_lock: PlatformCompanyLock | None,
+    global_lock: GlobalContactLock | None,
+    user_lock: UserCompanyLock | None,
 ) -> LockCheckResult:
-    """Single source of truth for the 3-tier check.
+    """The 3-tier priority decision, given already-fetched lock rows.
 
-    Order matters: platform-permanent always wins (brand-protective), then the
-    36h cooldown (shared rate-limit), then the user's own reply lock.
+    Single source of truth for ordering so the per-domain and batch entry
+    points can't drift. Order: platform-permanent (brand-protective) >
+    36h cooldown (shared rate-limit) > the user's own reply lock.
     """
-    domain = _normalize_domain(company_domain)
-    now = utcnow()
-
     # 1. Platform permanent stop
-    platform_lock = locks_repo.get_platform_lock(db, domain)
     if platform_lock is not None:
         return LockCheckResult(
             status=LockStatus.PLATFORM_PERMANENT,
@@ -74,7 +76,6 @@ def check_can_send_to_company(
         )
 
     # 2. Platform 36h cooldown
-    global_lock = locks_repo.get_global_lock(db, domain)
     if global_lock is not None:
         until = ensure_utc(global_lock.locked_until)
         if until > now:
@@ -85,7 +86,6 @@ def check_can_send_to_company(
             )
 
     # 3. Per-user 30-day reply lock
-    user_lock = locks_repo.get_user_company_lock(db, user_id, domain)
     if user_lock is not None:
         if user_lock.is_permanent:
             return LockCheckResult(
@@ -102,6 +102,63 @@ def check_can_send_to_company(
             )
 
     return LockCheckResult(status=LockStatus.AVAILABLE, unlocked_at=None, reason=None)
+
+
+def check_can_send_to_company(
+    db: OrmSession, *, user_id: int, company_domain: str
+) -> LockCheckResult:
+    """Single source of truth for the 3-tier check (one domain).
+
+    For listing endpoints that need many domains at once, use
+    `check_can_send_to_companies` — it batches the three lookups into three
+    queries total instead of three-per-row.
+    """
+    domain = _normalize_domain(company_domain)
+    return _resolve_lock_state(
+        now=utcnow(),
+        platform_lock=locks_repo.get_platform_lock(db, domain),
+        global_lock=locks_repo.get_global_lock(db, domain),
+        user_lock=locks_repo.get_user_company_lock(db, user_id, domain),
+    )
+
+
+def check_can_send_to_companies(
+    db: OrmSession, *, user_id: int, company_domains: list[str] | set[str]
+) -> dict[str, LockCheckResult]:
+    """Batched 3-tier check for a page of domains.
+
+    Three queries total (platform / global / user) regardless of how many
+    domains — kills the per-row N+1 in /inbox and /contacts browse. Returns a
+    dict keyed by NORMALIZED domain; callers should normalize their lookup key
+    the same way (lowercase+strip) or use the returned keys directly.
+    """
+    domains = {_normalize_domain(d) for d in company_domains if d}
+    if not domains:
+        return {}
+
+    now = utcnow()
+    platform_by_domain = {
+        row.company_domain: row
+        for row in locks_repo.list_platform_locks_for_domains(db, domains)
+    }
+    global_by_domain = {
+        row.company_domain: row
+        for row in locks_repo.list_global_locks_for_domains(db, domains)
+    }
+    user_by_domain = {
+        row.company_domain: row
+        for row in locks_repo.list_user_locks_for_domains(db, user_id, domains)
+    }
+
+    return {
+        domain: _resolve_lock_state(
+            now=now,
+            platform_lock=platform_by_domain.get(domain),
+            global_lock=global_by_domain.get(domain),
+            user_lock=user_by_domain.get(domain),
+        )
+        for domain in domains
+    }
 
 
 def record_send_to_company(

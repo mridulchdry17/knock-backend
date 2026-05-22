@@ -117,13 +117,18 @@ def list_available_contacts(
 
     # Per-row availability: the only remaining possibility on browse rows is
     # AVAILABLE or PLATFORM_COOLDOWN (the other two states were hard-filtered).
-    # We still go through the service so the result shape is consistent across
-    # browse and detail, and any future status added to the enum lights up here
-    # without a router change.
+    # Batched into 3 queries for the whole page (not 3-per-row); the result
+    # shape stays consistent with detail, and any future enum status lights up
+    # here without a router change.
+    page_domains = {company.domain for _, company in pairs}
+    lock_by_domain = locks_svc.check_can_send_to_companies(
+        db, user_id=user.id, company_domains=page_domains
+    )
+
     items: list[ContactBrowseOut] = []
     for contact, company in pairs:
-        avail = locks_svc.check_can_send_to_company(
-            db, user_id=user.id, company_domain=company.domain
+        avail = lock_by_domain.get(company.domain.strip().lower()) or locks_svc.LockCheckResult(
+            status=locks_svc.LockStatus.AVAILABLE, unlocked_at=None, reason=None
         )
         items.append(
             ContactBrowseOut(
