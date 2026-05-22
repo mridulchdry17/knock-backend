@@ -46,7 +46,17 @@ class Settings(BaseSettings):
     SESSION_TTL_DAYS: int = 30
 
     LOG_LEVEL: str = "INFO"
+    # Master switch for the in-process autopilot scheduler (APScheduler). OFF by
+    # default so dev / test / CI never auto-send. Turn ON only in the prod
+    # deployment (single process — see app/jobs/scheduler.py for the
+    # single-worker assumption).
     RUN_SCHEDULER: bool = False
+    # How often the autopilot cycle (batch-gen → send-drain → reply-ingest)
+    # fires. The cycle is idempotent, so batch generation effectively runs once
+    # per UTC day while the drain delivers each staggered send slot as it comes
+    # due and ingest pulls replies. 30 min gives finer granularity than the
+    # paid ~44-min send spacing without hammering the Gmail API.
+    AUTOPILOT_CYCLE_INTERVAL_MINUTES: int = 30
 
     # Comma-separated emails auto-promoted to tier='super_admin' on every login.
     # Renamed from ADMIN_EMAILS in Phase 4 to disambiguate from feature tiers.

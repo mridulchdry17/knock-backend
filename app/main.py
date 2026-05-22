@@ -16,8 +16,15 @@ async def lifespan(app: FastAPI):
     configure_logging()
     log = get_logger("startup")
     log.info("api.start", env=settings.APP_ENV, db=settings.DATABASE_URL)
-    yield
-    log.info("api.stop")
+    # Autopilot scheduler — no-op unless RUN_SCHEDULER is set (off in dev/test).
+    from app.jobs.scheduler import shutdown_scheduler, start_scheduler
+
+    start_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
+        log.info("api.stop")
 
 
 def create_app() -> FastAPI:
