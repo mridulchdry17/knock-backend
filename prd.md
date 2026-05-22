@@ -44,11 +44,12 @@
 | B5.7 | Autopilot daily-cycle cron + admin trigger | ✅ Done | `feat/b5-7-autopilot-worker` |
 | Frontend | F1–F9 (shell, auth, gmail, admin, today, templates, inbox, prefs, polish) | ✅ Done | `outreach-frontend` PRs #1–#10 |
 | Perf v0 | QueuePool + `pool_recycle`; batched lock checks (~10× reads) | ✅ Done | (cherry-picked to `pre-release`) |
+| Scheduler | APScheduler drives autopilot cycle on interval (`RUN_SCHEDULER` flag) | ✅ Done | on `pre-release` |
 | Tests | Backend suite | 🟡 259 passing | unit/router/service coverage; no full e2e against live Gmail yet |
 | Launch | v0 deploy ceremony (VM, prod `.env`, NSG close, Vercel flip) | ⬜ Next | see [memory: project_v0_deploy_bundle] |
 
 ### Known gaps (carried into v1 planning)
-- **No scheduler wired.** Send worker + reply ingestor only fire via super-admin endpoints (`POST /admin/send/drain`, `POST /admin/replies/ingest`) or `python -m app.jobs.*`. `/today` self-heals via lazy generation on first GET, but actual sending/ingest still needs a trigger. A systemd timer / APScheduler running `app.jobs.autopilot_cycle_cron` is the v1 fix.
+- ✅ **Scheduler wired (2026-05-23).** `app/jobs/scheduler.py` runs an in-process APScheduler firing `autopilot_cycle_cron.run_cycle` every `AUTOPILOT_CYCLE_INTERVAL_MINUTES` (default 30). Gated behind `RUN_SCHEDULER` (default off; **set `RUN_SCHEDULER=1` in prod `.env`** to enable). Single-process assumption — see the module docstring before scaling to multiple workers. Admin manual-trigger endpoints retained for the launch ceremony.
 - **No real templates table.** v0 renders a hardcoded student-persona default body; `template_id` is nullable end-to-end. Real templates are deferred.
 - **Remote-DB read latency.** Turso lives in `aws-ap-south-1`; even with pooling+batching, reads pay network round-trips. **Turso embedded replica** (local SQLite synced from remote) is the v1 perf play for microsecond reads.
 - **No live-Gmail e2e test.** Send/receive verified in unit/mocked tests; a real OAuth-scope send→reply→inbox dry run is still pending.
@@ -71,7 +72,7 @@
 | 14 | API spec | ✅ done | See live-endpoints table below |
 | 15 | Frontend contract | ✅ done | See FRONTEND.md; F1–F9 shipped |
 | 16 | Auth & sessions | ✅ done | bearer-token sessions + tier gating |
-| 17 | Background jobs | 🟡 | Job entrypoints exist; **no scheduler wired** (see gaps) |
+| 17 | Background jobs | ✅ | APScheduler wired (`RUN_SCHEDULER` flag); fires autopilot cycle on interval |
 | 18–20 | Config / structure / setup | ✅ done | — |
 | 21 | Testing strategy | 🟡 | 259 unit/router/service tests; no live-Gmail e2e |
 | 22 | Compliance | ✅ | Explicit-stop → permanent platform lock; 3-tier cooldowns |
