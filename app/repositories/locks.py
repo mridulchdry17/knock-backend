@@ -69,6 +69,22 @@ def list_active_global_locks(
     )
 
 
+def list_global_locks_for_domains(
+    db: OrmSession, domains: set[str]
+) -> list[GlobalContactLock]:
+    """Batch fetch — one query for all the supplied domains. Backs the
+    page-level lock check that avoids the per-row N+1."""
+    if not domains:
+        return []
+    return list(
+        db.scalars(
+            select(GlobalContactLock).where(
+                GlobalContactLock.company_domain.in_(domains)
+            )
+        ).all()
+    )
+
+
 # ─────────────────────────── user_company_locks (30-day per-user reply) ───────────────────────────
 
 
@@ -146,6 +162,23 @@ def list_active_user_locks(
     )
 
 
+def list_user_locks_for_domains(
+    db: OrmSession, user_id: int, domains: set[str]
+) -> list[UserCompanyLock]:
+    """Batch fetch this user's locks for the supplied domains — one query.
+    Returns ALL matching rows (active filtering happens in the service so the
+    priority/expiry logic stays in one place)."""
+    if not domains:
+        return []
+    return list(
+        db.scalars(
+            select(UserCompanyLock)
+            .where(UserCompanyLock.user_id == user_id)
+            .where(UserCompanyLock.company_domain.in_(domains))
+        ).all()
+    )
+
+
 # ─────────────────────────── platform_company_locks (permanent stop) ───────────────────────────
 
 
@@ -187,6 +220,21 @@ def list_platform_locks(db: OrmSession) -> list[PlatformCompanyLock]:
         db.scalars(
             select(PlatformCompanyLock).order_by(
                 PlatformCompanyLock.created_at.desc()
+            )
+        ).all()
+    )
+
+
+def list_platform_locks_for_domains(
+    db: OrmSession, domains: set[str]
+) -> list[PlatformCompanyLock]:
+    """Batch fetch — one query for all the supplied domains."""
+    if not domains:
+        return []
+    return list(
+        db.scalars(
+            select(PlatformCompanyLock).where(
+                PlatformCompanyLock.company_domain.in_(domains)
             )
         ).all()
     )

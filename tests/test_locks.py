@@ -240,3 +240,67 @@ def test_user_lock_permanent_flag_persists_through_expiry(
     )
     assert result.status == LockStatus.USER_REPLY_LOCK
     assert result.unlocked_at is None  # permanent → no countdown
+
+
+# ─────────────────────────── check_can_send_to_companies (batch) ───────────────────────────
+
+
+def test_batch_matches_per_domain_check(db: Session, user_a: User) -> None:
+    """The batched check must return the same verdict per domain as N single
+    calls — same priority logic, just one query set instead of N."""
+    # acme: 36h cooldown; beta: platform-permanent; gamma: user reply lock;
+    # delta: clean → available.
+    locks_svc.record_send_to_company(db, user_id=user_a.id, company_domain="acme.com")
+    locks_repo.upsert_platform_lock(db, "beta.io", reason="explicit_stop_reply")
+    locks_repo.upsert_user_company_lock(db, user_a.id, "gamma.dev", reason="reply")
+    db.commit()
+
+    domains = ["acme.com", "beta.io", "gamma.dev", "delta.app"]
+    batch = locks_svc.check_can_send_to_companies(
+        db, user_id=user_a.id, company_domains=domains
+    )
+
+    assert batch["acme.com"].status == LockStatus.PLATFORM_COOLDOWN
+    assert batch["beta.io"].status == LockStatus.PLATFORM_PERMANENT
+    assert batch["gamma.dev"].status == LockStatus.USER_REPLY_LOCK
+    assert batch["delta.app"].status == LockStatus.AVAILABLE
+
+    # Parity with the single-domain entry point.
+    for d in domains:
+        single = locks_svc.check_can_send_to_company(
+            db, user_id=user_a.id, company_domain=d
+        )
+        assert batch[d].status == single.status
+        assert batch[d].unlocked_at == single.unlocked_at
+
+
+def test_batch_empty_input_returns_empty(db: Session, user_a: User) -> None:
+    assert locks_svc.check_can_send_to_companies(
+        db, user_id=user_a.id, company_domains=[]
+    ) == {}
+
+
+def test_batch_normalizes_domains(db: Session, user_a: User) -> None:
+    """Mixed-case input keys to the normalized (lowercased) domain."""
+    locks_svc.record_send_to_company(db, user_id=user_a.id, company_domain="acme.com")
+    db.commit()
+
+    batch = locks_svc.check_can_send_to_companies(
+        db, user_id=user_a.id, company_domains=["  ACME.com "]
+    )
+    assert batch["acme.com"].status == LockStatus.PLATFORM_COOLDOWN
+
+
+def test_batch_per_user_isolation(db: Session, user_a: User, user_b: User) -> None:
+    """User A's reply lock must not bleed into user B's batch verdict."""
+    locks_repo.upsert_user_company_lock(db, user_a.id, "acme.com", reason="reply")
+    db.commit()
+
+    a = locks_svc.check_can_send_to_companies(
+        db, user_id=user_a.id, company_domains=["acme.com"]
+    )
+    b = locks_svc.check_can_send_to_companies(
+        db, user_id=user_b.id, company_domains=["acme.com"]
+    )
+    assert a["acme.com"].status == LockStatus.USER_REPLY_LOCK
+    assert b["acme.com"].status == LockStatus.AVAILABLE

@@ -5,9 +5,15 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 
 from app.config import settings
+
+# Recycle pooled libsql connections this many seconds after creation. Must stay
+# safely BELOW Turso's Hrana idle-stream TTL (~10s) so we never check out a
+# connection whose server-side stream has already expired. Tunable if Turso
+# changes the TTL or we observe stale-stream errors creeping back.
+LIBSQL_POOL_RECYCLE_SECONDS = 5
 
 
 class Base(DeclarativeBase):
@@ -87,22 +93,34 @@ def _build_engine() -> Engine:
         # the underlying connection autocommits them on dispatch.
         engine_kwargs["isolation_level"] = "AUTOCOMMIT"
 
-        # Hrana streams are stateful and TTL-expire after idle periods. Reusing a
-        # stale connection from a pool yields:
-        #   ValueError: Hrana: api error: status=404 ...
-        #     {"error":"stream not found: <id>"}
-        # pool_pre_ping doesn't catch this for libsql (the ping itself runs over
-        # a stream that's already dead). NullPool issues a fresh connection on
-        # every checkout — cheap at v0 traffic, eliminates the failure mode.
-        engine_kwargs["poolclass"] = NullPool
-        engine_kwargs.pop("pool_pre_ping", None)
+        # Hrana streams are stateful and the server TTL-expires them after a short
+        # idle window (~10s). We previously used NullPool to dodge stale-stream
+        # 404s ("stream not found: <id>") by opening a fresh connection per
+        # request — correct, but it pays a full TLS + Hrana handshake to the
+        # remote DB on EVERY request (~hundreds of ms each), which is the bulk
+        # of the per-request latency at v0.
+        #
+        # Switch to the default QueuePool with pool_recycle BELOW the Hrana idle
+        # TTL: a connection younger than LIBSQL_POOL_RECYCLE_SECONDS is reused
+        # (no handshake), anything older is transparently discarded + reopened on
+        # checkout — so we never hand a stale stream to a query. This makes
+        # bursty traffic (a page firing several queries, or back-to-back
+        # navigations) reuse one warm connection instead of N cold ones.
+        # pool_pre_ping stays on as a belt-and-suspenders for the rare race where
+        # the server kills a stream inside the recycle window.
+        # The libsql dialect defaults to SingletonThreadPool (one shared
+        # connection, no overflow knobs); force QueuePool so pool_size /
+        # max_overflow / pool_recycle apply.
+        engine_kwargs["poolclass"] = QueuePool
+        engine_kwargs["pool_recycle"] = LIBSQL_POOL_RECYCLE_SECONDS
+        engine_kwargs["pool_size"] = 5
+        engine_kwargs["max_overflow"] = 10
 
         # Suppress the connection-return ROLLBACK. With AUTOCOMMIT isolation
         # there is nothing to roll back; the dialect issues a `rollback()` on
-        # session close anyway, which then trips a fresh Hrana stream lookup
-        # on an already-dead stream and noisily 404s in the logs (see "Exception
-        # during reset or similar"). Skipping reset is safe on NullPool because
-        # the connection is disposed, not recycled.
+        # session close anyway, which then trips a fresh Hrana stream lookup on
+        # an already-dead stream and noisily 404s in the logs (see "Exception
+        # during reset or similar").
         engine_kwargs["pool_reset_on_return"] = None
 
     eng = create_engine(url, **engine_kwargs)

@@ -83,6 +83,13 @@ def list_replies(
             for c in db.scalars(select(Company).where(Company.id.in_(company_ids))).all()
         }
 
+    # Batch the lock checks: one set of 3 queries for the whole page instead
+    # of 3-per-row. Derived at read time so admin lock-clears flow through.
+    page_domains = {r.company_domain for r in rows if r.company_domain}
+    lock_by_domain = locks_svc.check_can_send_to_companies(
+        db, user_id=user.id, company_domains=page_domains
+    )
+
     items: list[InboxItemOut] = []
     for r in rows:
         contact = contacts_by_id.get(r.to_contact_id or r.contact_id or 0)
@@ -92,9 +99,9 @@ def list_replies(
             else None
         )
 
-        # Lock state — derive at read time so admin clears flow through.
-        avail = locks_svc.check_can_send_to_company(
-            db, user_id=user.id, company_domain=(r.company_domain or "")
+        domain_key = (r.company_domain or "").strip().lower()
+        avail = lock_by_domain.get(domain_key) or locks_svc.LockCheckResult(
+            status=locks_svc.LockStatus.AVAILABLE, unlocked_at=None, reason=None
         )
 
         items.append(
