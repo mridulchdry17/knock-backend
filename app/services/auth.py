@@ -133,6 +133,14 @@ def complete_google_login(
         users_repo.set_waitlist_email(db, user, decision.claim_email)
     users_repo.set_tier(db, user, decision.new_tier)
 
+    # Seed the 3 starter templates once the user reaches an active tier.
+    # Idempotent (no-op if they already have any), so it's safe on every login;
+    # pending users don't get them until approved.
+    if decision.new_tier != "pending":
+        from app.services import templates as templates_svc
+
+        templates_svc.seed_starters(db, user)
+
     session = sessions_service.issue(db, user_id=user.id, user_agent=user_agent, ip=ip)
     db.commit()
     return user, session, decision

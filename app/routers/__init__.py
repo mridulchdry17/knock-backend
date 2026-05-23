@@ -8,6 +8,7 @@ from app.routers import (
     inbox,
     onboarding,
     preferences,
+    templates,
     today,
     waitlist,
 )
@@ -24,3 +25,4 @@ def register(app: FastAPI) -> None:
     app.include_router(contacts.router)
     app.include_router(today.router)
     app.include_router(inbox.router)
+    app.include_router(templates.router)

@@ -33,9 +33,11 @@ from app.logging_config import get_logger
 from app.models import Company, Contact, TodayBatchItem, User
 from app.repositories import locks as locks_repo
 from app.repositories import preferences as prefs_repo
+from app.repositories import templates as templates_repo
 from app.repositories import today_batch as today_repo
 from app.repositories import users as users_repo
 from app.services import send_caps
+from app.services import templates as templates_svc
 from app.services.today_picker import (
     ContactCandidate,
     pick_companies_for_user,
@@ -158,26 +160,16 @@ def _is_autopilot_active(user: User) -> bool:
 def _render_default_template(
     *, to_contact: Contact | None, company: Company | None, sender_name: str | None
 ) -> tuple[str, str]:
-    """Substitute the hardcoded placeholders. v0 renderer; B5.7 swap-point."""
-    first_name = "there"
-    if to_contact is not None and to_contact.name:
-        first_name = to_contact.name.split(" ", 1)[0] or "there"
-
-    company_name = company.name if company is not None else (
-        company.domain if company is not None else "your company"
+    """Fallback render for users with no templates (shouldn't happen post-seed,
+    but defensive). Routes the hardcoded default through the shared renderer so
+    the full placeholder set + fallbacks apply consistently."""
+    return templates_svc.render_template(
+        _DEFAULT_SUBJECT,
+        _DEFAULT_BODY,
+        to_contact=to_contact,
+        company=company,
+        sender_name=sender_name,
     )
-
-    replacements = {
-        "{{first_name}}": first_name,
-        "{{company}}": company_name,
-        "{{sender_name}}": sender_name or "a Knock user",
-    }
-    subject = _DEFAULT_SUBJECT
-    body = _DEFAULT_BODY
-    for k, v in replacements.items():
-        subject = subject.replace(k, v)
-        body = body.replace(k, v)
-    return subject, body
 
 
 # ─────────────────────────── public API ───────────────────────────
@@ -269,13 +261,31 @@ def generate_batch_for_user(
         for co in db.scalars(select(Company).where(Company.id.in_(company_ids))).all()
     }
 
+    # The day's batch renders from the user's default template (their first
+    # starter / oldest). Manual users can switch a card's template afterward via
+    # PATCH /today/items; autopilot uses this default as-is. Falls back to the
+    # hardcoded body only if the user somehow has no templates.
+    default_tpl = templates_repo.default_for_user(db, user.id)
+
     items_created = 0
     for pick in picks:
-        subject, body = _render_default_template(
-            to_contact=contacts_by_id.get(pick.to_contact_id),
-            company=companies_by_id.get(pick.company_id),
-            sender_name=sender_name,
-        )
+        to_contact = contacts_by_id.get(pick.to_contact_id)
+        company = companies_by_id.get(pick.company_id)
+        if default_tpl is not None:
+            subject, body = templates_svc.render_template(
+                default_tpl.subject,
+                default_tpl.body,
+                to_contact=to_contact,
+                company=company,
+                sender_name=sender_name,
+            )
+            template_id = default_tpl.id
+        else:
+            subject, body = _render_default_template(
+                to_contact=to_contact, company=company, sender_name=sender_name
+            )
+            template_id = None
+
         item = TodayBatchItem(
             user_id=user.id,
             batch_date=batch_date,
@@ -283,7 +293,7 @@ def generate_batch_for_user(
             company_domain=pick.company_domain,
             to_contact_id=pick.to_contact_id,
             cc_contact_ids=TodayBatchItem.encode_cc(pick.cc_contact_ids),
-            template_id=None,
+            template_id=template_id,
             subject=subject,
             body=body,
             send_time=pick.send_time,
