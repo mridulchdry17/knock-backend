@@ -53,6 +53,8 @@
 - **No real templates table.** v0 renders a hardcoded student-persona default body; `template_id` is nullable end-to-end. Real templates are deferred.
 - **Remote-DB read latency.** Turso lives in `aws-ap-south-1`; even with pooling+batching, reads pay network round-trips. **Turso embedded replica** (local SQLite synced from remote) is the v1 perf play for microsecond reads.
 - **No live-Gmail e2e test.** Send/receive verified in unit/mocked tests; a real OAuth-scope send→reply→inbox dry run is still pending.
+- **DEFERRED (accepted risk, 2026-05-23) — no unsubscribe footer / `List-Unsubscribe` header.** Conscious call: Knock sends low-volume (≤20/day), personalized 1-to-1 mail from each user's *own* Gmail, and the reply-"stop" → permanent-lock flow (B5.6) already provides the opt-out. A visible footer would make the mail read like a bulk campaign and hurt reply rates. Revisit if/when volume rises or a bulk-marketing surface is added. Cheap v1 add: the invisible `List-Unsubscribe: <mailto:…?subject=unsubscribe>` header (no body change), which dovetails with the existing stop detection.
+- **DEFERRED (accepted risk, 2026-05-23) — no API rate limiting.** Conscious call: v0 is OAuth + soft-gate-approval gated (~100-user Google testing cap), so the abuse surface is tiny and Caddy can rate-limit at the edge later. Residual: public `POST /waitlist` returns 409-on-duplicate → email presence-oracle. Cheapest v1 mitigation (no limiter needed): return 200 for both new and duplicate to kill the oracle.
 
 ### Per-section status (mapped to PRD numbering)
 
