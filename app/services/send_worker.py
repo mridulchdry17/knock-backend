@@ -32,7 +32,7 @@ from app.logging_config import get_logger
 from app.models import Contact, EmailFailure, SendQueue, TodayBatchItem, User
 from app.repositories import email_failures as failures_repo
 from app.repositories import locks as locks_repo
-from app.services import gmail_send
+from app.services import gmail_send, send_caps
 from app.services.google_oauth import OAuthError, get_user_credentials
 
 log = get_logger("send_worker")
@@ -228,6 +228,26 @@ def drain_due_items(
         if user.gmail_disconnected:
             _record_skip(db, item, reason="gmail_disconnected")
             summary.skipped += 1
+            continue
+
+        # Enforce the daily cap at dispatch — the picker caps batch *size* at
+        # generation, but extra 'ready' rows can appear afterward (lazy-gen on
+        # GET /today, a user re-readying skipped cards, a lowered cap). Without
+        # this re-check the worker would send them all and blow past the limit,
+        # wrecking Gmail deliverability. We DON'T mark the item skipped (that's
+        # terminal) — leave it 'ready' so it sends after tomorrow's sent_today
+        # reset. `user` is the identity-mapped instance, so sent_today stays
+        # current across this user's items within the run (each success bumps it).
+        cap = send_caps.resolve_daily_cap(user)
+        if (user.sent_today or 0) >= cap:
+            summary.skipped += 1
+            log.info(
+                "send_worker.daily_cap_reached",
+                user_id=user.id,
+                today_batch_item_id=item.id,
+                sent_today=user.sent_today,
+                cap=cap,
+            )
             continue
 
         if item.to_contact_id is None:

@@ -405,3 +405,67 @@ def test_successful_send_extends_existing_global_lock(
     db.expire_all()
     updated = db.get(GlobalContactLock, "acme.com").locked_until
     assert updated >= original
+
+
+# ─────────────────────────── daily-cap enforcement ───────────────────────────
+
+
+def test_drain_skips_when_user_already_at_cap(
+    db: Session, user: User, company: Company, to_contact: Contact
+) -> None:
+    """A user already at their cap must not get another send. The item stays
+    'ready' (not terminal 'skipped') so it sends after the next daily reset.
+    daily_limit set explicitly so the test is deterministic regardless of the
+    tier-default."""
+    user.daily_limit = 5
+    user.sent_today = 5  # at cap
+    db.commit()
+    item = _make_item(db, user=user, company=company, to_contact=to_contact)
+
+    success = gmail_send.SendResult(ok=True, gmail_message_id="m")
+    with _stub_send(success):
+        summary = send_worker.drain_due_items(db)
+
+    assert summary.attempted == 1
+    assert summary.sent == 0
+    assert summary.skipped == 1
+
+    db.expire_all()
+    item = db.get(TodayBatchItem, item.id)
+    assert item.status == "ready"  # NOT marked skipped/sent — retries after reset
+    u = db.get(User, user.id)
+    assert u.sent_today == 5  # unchanged
+
+
+def test_drain_enforces_cap_mid_run_across_items(
+    db: Session, user: User, company: Company, to_contact: Contact
+) -> None:
+    """With a cap of 2 and 3 ready items for the same user, exactly 2 send and
+    the 3rd is held (cap reached as sent_today climbs within the run)."""
+    user.daily_limit = 2  # override → cap=2
+    user.sent_today = 0
+    db.commit()
+
+    # Three distinct companies/contacts so each item is its own send.
+    items = []
+    for i in range(3):
+        co = Company(domain=f"c{i}.com", name=f"C{i}", source="seed")
+        db.add(co)
+        db.flush()
+        ct = Contact(company_id=co.id, email=f"x@c{i}.com", name=f"X{i}")
+        db.add(ct)
+        db.flush()
+        items.append(_make_item(db, user=user, company=co, to_contact=ct))
+
+    success = gmail_send.SendResult(ok=True, gmail_message_id="m")
+    with _stub_send(success):
+        summary = send_worker.drain_due_items(db)
+
+    assert summary.sent == 2
+    assert summary.skipped == 1
+
+    db.expire_all()
+    u = db.get(User, user.id)
+    assert u.sent_today == 2
+    statuses = sorted(db.get(TodayBatchItem, it.id).status for it in items)
+    assert statuses == ["ready", "sent", "sent"]  # one held at 'ready'

@@ -35,6 +35,7 @@ from app.repositories import locks as locks_repo
 from app.repositories import preferences as prefs_repo
 from app.repositories import today_batch as today_repo
 from app.repositories import users as users_repo
+from app.services import send_caps
 from app.services.today_picker import (
     ContactCandidate,
     pick_companies_for_user,
@@ -43,13 +44,9 @@ from app.services.today_picker import (
 log = get_logger("batch_generator")
 
 # ─────────────────────────── tier → daily cap ───────────────────────────
-
-_TIER_DEFAULT_CAPS: dict[str, int] = {
-    "free": 7,
-    "paid": 20,
-    # super_admin treated as paid for v0 (devs need realistic send volume to test).
-    "super_admin": 20,
-}
+# Canonical cap logic lives in send_caps so the picker (batch size) and the
+# send worker (dispatch enforcement) share one source and can't drift.
+_TIER_DEFAULT_CAPS = send_caps.TIER_DEFAULT_CAPS
 
 # v0 default template body — student persona, hardcoded until B5.7 ships
 # real templates. Mustache-ish placeholders so we can dropreplace cheaply
@@ -81,11 +78,8 @@ class BatchGenerationResult:
 
 
 def _resolve_cap(user: User) -> int:
-    """daily_limit override beats tier default."""
-    default = _TIER_DEFAULT_CAPS.get(user.tier, 0)
-    if user.daily_limit and user.daily_limit > 0:
-        return user.daily_limit
-    return default
+    """Thin alias to the shared resolver (kept for local call-site readability)."""
+    return send_caps.resolve_daily_cap(user)
 
 
 def _is_eligible(user: User) -> str | None:
