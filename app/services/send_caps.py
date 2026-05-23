@@ -21,8 +21,20 @@ TIER_DEFAULT_CAPS: dict[str, int] = {
 
 
 def resolve_daily_cap(user: User) -> int:
-    """Per-user daily send cap. An explicit `daily_limit > 0` override beats
-    the tier default; otherwise fall back to the tier default (0 if no tier)."""
+    """Per-user daily send cap.
+
+    The tier default is a HARD CEILING (free=7, paid=20). `daily_limit` is an
+    admin throttle that can only LOWER that ceiling, never raise it — so it's
+    `min(tier_default, daily_limit)` when set.
+
+    Why min() and not "override beats tier": `User.daily_limit` defaults to
+    `DEFAULT_DAILY_LIMIT` (20) for every row, so a plain "override beats tier"
+    rule silently gave free users a cap of 20 and the locked free=7 rule was
+    never enforced. With min(), the default-20 is harmless for free
+    (min(7,20)=7), an admin can still throttle anyone down (e.g. set 3 → 3),
+    and nobody exceeds their tier ceiling. A tier absent from the map → 0.
+    """
+    tier_default = TIER_DEFAULT_CAPS.get(user.tier, 0)
     if user.daily_limit and user.daily_limit > 0:
-        return user.daily_limit
-    return TIER_DEFAULT_CAPS.get(user.tier, 0)
+        return min(tier_default, user.daily_limit)
+    return tier_default

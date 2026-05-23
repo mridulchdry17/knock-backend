@@ -24,6 +24,7 @@ from app.schemas.today import (
     UpdateItemIn,
 )
 from app.services import batch_generator as batch_gen_svc
+from app.services import send_caps
 
 router = APIRouter(
     prefix="/api/v1/today",
@@ -202,7 +203,9 @@ def get_today(user: CurrentUser, db: DbDep) -> TodayBatchOut:
     return TodayBatchOut(
         generated_at=generated_at,
         date=today,
-        cap=user.daily_limit if user.daily_limit and user.daily_limit > 0 else len(items),
+        # Show the real effective cap (tier ceiling, lowered by any admin
+        # throttle) — not the raw daily_limit, which defaults to 20 for all.
+        cap=send_caps.resolve_daily_cap(user),
         sent_today=user.sent_today,
         items=_hydrate(db, items),
     )
