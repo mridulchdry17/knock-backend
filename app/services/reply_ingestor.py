@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from app.core.time import ensure_utc
 from app.logging_config import get_logger
-from app.models import SendQueue, TodayBatchItem, User
+from app.models import Contact, SendQueue, TodayBatchItem, User
 from app.services import gmail_reply_fetcher
 from app.services import locks as locks_svc
 from app.services.explicit_stop import is_explicit_stop
@@ -50,6 +50,7 @@ class IngestSummary:
     replies_matched: int
     explicit_stops: int
     user_reply_locks_written: int
+    bounces: int = 0
     error_kind: str | None = None
 
 
@@ -94,6 +95,14 @@ def _process_reply(
     )
     if sq is None:
         # Not a reply to a Knock send (could be any other inbound mail).
+        return
+
+    # Bounce path — a delivery-failure notice lands on the original send's
+    # thread. Treating it as a reply would lock a DEAD address as if the person
+    # engaged. Instead mark the contact invalid (picker excludes it) so the bad
+    # address stops recirculating and eroding sender reputation.
+    if reply.is_bounce:
+        _handle_bounce(db, user=user, sq=sq, summary_counters=summary_counters)
         return
 
     # Already-processed guard — same thread arriving again (e.g. user marks
@@ -154,12 +163,61 @@ def _process_reply(
     )
 
 
+def _handle_bounce(
+    db: OrmSession,
+    *,
+    user: User,
+    sq: SendQueue,
+    summary_counters: dict[str, int],
+) -> None:
+    """Mark the bounced send's TO contact invalid and flag the send as bounced.
+
+    No reply lock is written. If the contact came from the scraper (it carries
+    a `scraped_pattern`), the address was a *guess* that failed — the scraper's
+    retry path should try the next email-guess pattern (e.g. firstname.lastname
+    → f.lastname). That alternate-pattern generation ships WITH the scraper; for
+    now we mark invalid + log the retry signal so no scraped pattern is lost.
+    No commit here — caller owns the txn.
+    """
+    summary_counters["bounces"] += 1
+    sq.status = "BOUNCED"
+    db.add(sq)
+
+    contact_id = sq.to_contact_id or sq.contact_id
+    contact = db.get(Contact, contact_id) if contact_id else None
+    if contact is None:
+        log.warning("reply_ingestor.bounce_contact_missing", send_queue_id=sq.id)
+        return
+
+    contact.is_invalid = True
+    db.add(contact)
+
+    if contact.scraped_pattern:
+        # Scraper hook: this guessed address bounced — the scraper should retry
+        # with an alternate pattern. (Generation lands with the scraper.)
+        log.info(
+            "reply_ingestor.scraped_contact_bounced",
+            user_id=user.id,
+            contact_id=contact.id,
+            company_domain=sq.company_domain,
+            scraped_pattern=contact.scraped_pattern,
+        )
+    else:
+        log.info(
+            "reply_ingestor.contact_bounced_invalidated",
+            user_id=user.id,
+            contact_id=contact.id,
+            company_domain=sq.company_domain,
+        )
+
+
 def _empty_counters() -> dict[str, int]:
     return {
         "processed": 0,
         "replies_matched": 0,
         "explicit_stops": 0,
         "user_reply_locks_written": 0,
+        "bounces": 0,
     }
 
 

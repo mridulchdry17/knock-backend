@@ -30,7 +30,11 @@ from app.repositories import locks as locks_repo
 # the semantics they implement. If a knob needs to be tunable per-env later,
 # we lift to settings; for v0 the product values are stable.
 DEFAULT_COOLDOWN_HOURS = 36
-DEFAULT_USER_REPLY_LOCK_DAYS = 30
+# Per-user reply lock: when a user gets a reply from a company, autopilot
+# stops re-sending to that company FOR THAT USER for this long. Shortened from
+# 30 → 2 days (product decision 2026-05-24) so a contacted company recycles
+# back into rotation quickly instead of being parked for a month.
+DEFAULT_USER_REPLY_LOCK_DAYS = 2
 
 
 class LockStatus(StrEnum):

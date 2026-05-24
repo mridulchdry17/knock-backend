@@ -24,6 +24,7 @@ Quotas + caps:
 from __future__ import annotations
 
 import base64
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,11 @@ class FetchedReply:
     subject: str
     body_text: str
     internal_date: datetime
+    # True when this inbound message is an automated bounce / delivery-failure
+    # notice (mailer-daemon, a message/delivery-status part, or a failure
+    # subject) rather than a human reply. The ingestor routes bounces to the
+    # invalid-contact path instead of writing a reply lock.
+    is_bounce: bool = False
 
 
 class FetchError(Exception):
@@ -157,6 +163,36 @@ def _parse_from(raw: str) -> tuple[str, str]:
     addr = addr.strip().strip("<>").strip()
     domain = addr.partition("@")[2].lower()
     return addr, domain
+
+
+_BOUNCE_FROM_RE = re.compile(r"\b(mailer-daemon|postmaster)\b", re.IGNORECASE)
+_BOUNCE_SUBJECT_RE = re.compile(
+    r"(delivery status notification|undelivered mail|mail delivery (failed|subsystem)"
+    r"|failure notice|returned to sender|address not found)",
+    re.IGNORECASE,
+)
+
+
+def _has_delivery_status_part(payload: dict[str, Any]) -> bool:
+    """True if any MIME part is the RFC-3464 machine bounce report
+    (message/delivery-status) — the most reliable bounce signal."""
+    mime = (payload.get("mimeType") or "").lower()
+    if "delivery-status" in mime or "report" in mime:
+        return True
+    return any(_has_delivery_status_part(p) for p in (payload.get("parts") or []))
+
+
+def _detect_bounce(
+    *, from_email: str, subject: str, payload: dict[str, Any]
+) -> bool:
+    """Classify an inbound message as a bounce. Any one signal is enough —
+    we'd rather over-detect a bounce (mark a contact invalid) than mis-file a
+    delivery failure as a real reply and lock a dead address for days."""
+    if _BOUNCE_FROM_RE.search(from_email or ""):
+        return True
+    if _BOUNCE_SUBJECT_RE.search(subject or ""):
+        return True
+    return _has_delivery_status_part(payload)
 
 
 def _parse_internal_date(raw: str | int | None) -> datetime:
@@ -294,6 +330,9 @@ def fetch_new_replies(
             subject = _extract_header(headers, "Subject")
             body_text = _extract_plain_body(payload)
             internal_date = _parse_internal_date(full.get("internalDate"))
+            is_bounce = _detect_bounce(
+                from_email=from_email, subject=subject, payload=payload
+            )
 
             replies.append(
                 FetchedReply(
@@ -304,6 +343,7 @@ def fetch_new_replies(
                     subject=subject,
                     body_text=body_text,
                     internal_date=internal_date,
+                    is_bounce=is_bounce,
                 )
             )
 

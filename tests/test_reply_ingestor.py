@@ -105,15 +105,22 @@ def _seed_today_batch_item(
     return item
 
 
-def _reply(*, thread_id: str, body: str = "Sounds good!", msg_id: str = "msg-in-1") -> gmail_reply_fetcher.FetchedReply:
+def _reply(
+    *,
+    thread_id: str,
+    body: str = "Sounds good!",
+    msg_id: str = "msg-in-1",
+    is_bounce: bool = False,
+) -> gmail_reply_fetcher.FetchedReply:
     return gmail_reply_fetcher.FetchedReply(
         gmail_message_id=msg_id,
         gmail_thread_id=thread_id,
-        from_email="john@acme.com",
+        from_email="mailer-daemon@googlemail.com" if is_bounce else "john@acme.com",
         from_domain="acme.com",
-        subject="Re: Quick intro",
+        subject="Delivery Status Notification (Failure)" if is_bounce else "Re: Quick intro",
         body_text=body,
         internal_date=datetime.now(UTC),
+        is_bounce=is_bounce,
     )
 
 
@@ -332,3 +339,55 @@ def test_platform_permanent_lock_is_upserted_not_duplicated(db: Session) -> None
         db.scalars(select(PlatformCompanyLock).where(PlatformCompanyLock.company_domain == "acme.com")).all()
     )
     assert len(perms) == 1
+
+
+# ─────────────────────────── bounce handling ───────────────────────────
+
+
+def test_bounce_marks_contact_invalid_not_reply_lock(db: Session) -> None:
+    """A bounce on the send thread must invalidate the contact, NOT write a
+    reply lock."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    company, contact = _seed_company_contact(db)
+    sq = _seed_send_queue_row(db, user=user, company=company, contact=contact, thread_id="thr-b")
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher, "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-b", is_bounce=True)], 5),
+    ):
+        summary = ri.ingest_replies_for_user(db, user)
+
+    assert summary.bounces == 1
+    assert summary.replies_matched == 0
+    assert summary.user_reply_locks_written == 0
+
+    db.refresh(contact)
+    db.refresh(sq)
+    assert contact.is_invalid is True
+    assert sq.status == "BOUNCED"
+
+    # No per-user reply lock written.
+    from app.models import UserCompanyLock as _UCL
+
+    assert db.scalar(select(_UCL).where(_UCL.user_id == user.id)) is None
+
+
+def test_bounce_on_scraped_contact_still_invalidates(db: Session) -> None:
+    """Scraped contact (carries scraped_pattern) bounces → invalidated + logged
+    as a scraper-retry signal. (Alternate-pattern generation ships with the
+    scraper; here we just confirm it's invalidated, not reply-locked.)"""
+    user = _make_user(db, email="u@x.com", tier="free")
+    company, contact = _seed_company_contact(db)
+    contact.scraped_pattern = "firstname.lastname"
+    db.commit()
+    _seed_send_queue_row(db, user=user, company=company, contact=contact, thread_id="thr-sb")
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher, "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-sb", is_bounce=True)], 9),
+    ):
+        summary = ri.ingest_replies_for_user(db, user)
+
+    assert summary.bounces == 1
+    db.refresh(contact)
+    assert contact.is_invalid is True
