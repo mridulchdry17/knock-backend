@@ -21,6 +21,7 @@ from app.core.errors import ApiError
 from app.logging_config import get_logger
 from app.models import Company, Contact, Template, User
 from app.repositories import templates as templates_repo
+from app.services.html_to_text import html_to_text
 
 log = get_logger("templates")
 
@@ -124,7 +125,13 @@ def render_template(
             return val
         return _PLACEHOLDER_FALLBACKS.get(key, match.group(0))
 
-    return _FOLLOWUP_RE.sub(_sub, subject), _FOLLOWUP_RE.sub(_sub, body)
+    # Subject is authored in a plain input (never HTML); the body comes from the
+    # rich-text editor as HTML, so substitute placeholders first (the {{token}}
+    # text lives inside the variable spans) then flatten to plain text for the
+    # text/plain email + the /today preview.
+    rendered_subject = _FOLLOWUP_RE.sub(_sub, subject)
+    rendered_body = html_to_text(_FOLLOWUP_RE.sub(_sub, body))
+    return rendered_subject, rendered_body
 
 
 # ─────────────────────────── starter seeding ───────────────────────────

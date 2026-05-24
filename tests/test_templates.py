@@ -66,6 +66,31 @@ def test_render_hr_name_is_full_contact_name() -> None:
     assert body == "Dear Akanksha Puri"
 
 
+def test_render_flattens_rich_text_html_body_to_plain_text() -> None:
+    # The rich-text editor stores the body as HTML, including variable spans.
+    # render must substitute placeholders AND flatten to plain text so the
+    # text/plain email doesn't show literal <p> tags (the reported bug).
+    html_body = (
+        '<p>Hi <span data-variable="first_name">{{first_name}}</span>,</p>'
+        "<p>I'm a student really interested in "
+        '<span data-variable="company">{{company}}</span>.</p>'
+        "<p>Best,<br>{{sender_name}}</p>"
+    )
+    _subj, body = templates_svc.render_template(
+        "Hello {{company}}",
+        html_body,
+        to_contact=_contact("Alex Rivera", "Recruiter"),
+        company=_company("Acme Inc"),
+        sender_name="Mridul Chaudhary",
+    )
+    assert "<p>" not in body and "</p>" not in body and "<span" not in body
+    assert body == (
+        "Hi Alex,\n\n"
+        "I'm a student really interested in Acme Inc.\n\n"
+        "Best,\nMridul Chaudhary"
+    )
+
+
 # ─────────────────────────── seeding ───────────────────────────
 
 
