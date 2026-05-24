@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import Depends, status
@@ -8,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.errors import ApiError
+from app.core.time import ensure_utc, utcnow
 from app.db.session import get_db
 from app.logging_config import get_logger
 from app.models import User
@@ -15,6 +17,12 @@ from app.repositories import sessions as sessions_repo
 from app.repositories import users as users_repo
 
 log = get_logger("deps")
+
+# Only refresh a session's last_used_at if it's older than this. The field is
+# coarse "last seen" activity tracking — writing it on EVERY request put a
+# remote DB write (~150-250ms) on the hot path of every authenticated call.
+# Throttling collapses that to at most one write per session per window.
+SESSION_TOUCH_THROTTLE = timedelta(minutes=15)
 
 DbDep = Annotated[OrmSession, Depends(get_db)]
 
@@ -66,15 +74,18 @@ def get_current_user(
             "account_suspended", "Account is suspended", status_code=status.HTTP_403_FORBIDDEN
         )
 
-    # Last-seen update is best-effort. Turso's Hrana protocol expires idle streams
-    # aggressively; if the touch/commit hits a stale stream we don't want to fail
-    # the whole request — that just means last_seen_at lags by one hit.
-    try:
-        sessions_repo.touch(db, session)
-        db.commit()
-    except Exception as exc:  # pragma: no cover — Turso transport flake
-        log.warning("session.touch_failed", error=str(exc), session_id=session.id)
-        db.rollback()
+    # Throttled last-seen update. Writing last_used_at on every request put a
+    # remote write on the hot path of every authenticated call; we only refresh
+    # it once the stored value is older than SESSION_TOUCH_THROTTLE. Still
+    # best-effort: a Turso stream hiccup must not fail the request.
+    last_used = ensure_utc(session.last_used_at) if session.last_used_at else None
+    if last_used is None or (utcnow() - last_used) > SESSION_TOUCH_THROTTLE:
+        try:
+            sessions_repo.touch(db, session)
+            db.commit()
+        except Exception as exc:  # pragma: no cover — Turso transport flake
+            log.warning("session.touch_failed", error=str(exc), session_id=session.id)
+            db.rollback()
     return user
 
 
