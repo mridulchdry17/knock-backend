@@ -391,3 +391,79 @@ def test_bounce_on_scraped_contact_still_invalidates(db: Session) -> None:
     assert summary.bounces == 1
     db.refresh(contact)
     assert contact.is_invalid is True
+
+
+def test_scraped_bounce_advances_to_next_pattern(db: Session) -> None:
+    """A scraped contact whose guess bounces gets its email advanced to the
+    next pattern and stays in rotation (NOT invalidated)."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    company = Company(domain="acme.com", name="Acme", source="scrape")
+    db.add(company)
+    db.flush()
+    contact = Contact(
+        company_id=company.id,
+        name="Akanksha Puri",
+        email="akanksha.puri@acme.com",
+        scraped_pattern="firstname.lastname",
+    )
+    db.add(contact)
+    db.commit()
+    _seed_send_queue_row(db, user=user, company=company, contact=contact, thread_id="thr-sp")
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher, "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-sp", is_bounce=True)], 3),
+    ):
+        summary = ri.ingest_replies_for_user(db, user)
+
+    assert summary.bounces == 1
+    db.refresh(contact)
+    # Advanced firstname.lastname → firstname, still in rotation.
+    assert contact.email == "akanksha@acme.com"
+    assert contact.scraped_pattern == "firstname"
+    assert contact.is_invalid is False
+
+
+def test_scraped_bounce_invalidates_when_patterns_exhausted(db: Session) -> None:
+    user = _make_user(db, email="u@x.com", tier="free")
+    company = Company(domain="acme.com", name="Acme", source="scrape")
+    db.add(company)
+    db.flush()
+    contact = Contact(
+        company_id=company.id,
+        name="Akanksha Puri",
+        email="puri@acme.com",
+        scraped_pattern="lastname",  # the last pattern in the order
+    )
+    db.add(contact)
+    db.commit()
+    _seed_send_queue_row(db, user=user, company=company, contact=contact, thread_id="thr-ex")
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher, "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-ex", is_bounce=True)], 4),
+    ):
+        ri.ingest_replies_for_user(db, user)
+
+    db.refresh(contact)
+    assert contact.is_invalid is True
+    assert contact.invalid_reason == "bounce_patterns_exhausted"
+
+
+def test_csv_bounce_sets_invalid_reason_bounce(db: Session) -> None:
+    """A non-scraped (CSV) contact bounce → invalid + reason 'bounce' for the
+    admin review list. No pattern retry."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    company, contact = _seed_company_contact(db)  # no scraped_pattern
+    _seed_send_queue_row(db, user=user, company=company, contact=contact, thread_id="thr-csv")
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher, "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-csv", is_bounce=True)], 6),
+    ):
+        ri.ingest_replies_for_user(db, user)
+
+    db.refresh(contact)
+    assert contact.is_invalid is True
+    assert contact.invalid_reason == "bounce"
+    assert contact.scraped_pattern is None

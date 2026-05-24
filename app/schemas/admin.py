@@ -86,6 +86,7 @@ class AdminContactOut(BaseModel):
     notes: str | None
     scraped_pattern: str | None
     is_invalid: bool
+    invalid_reason: str | None = None
     created_at: datetime
 
 

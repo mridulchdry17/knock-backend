@@ -44,18 +44,24 @@ def list_admin_paginated(
     *,
     search: str | None = None,
     company_domain: str | None = None,
+    invalid_only: bool = False,
     limit: int,
     offset: int,
 ) -> tuple[list[tuple[Contact, Company]], int]:
     """Returns ((contact, company) pairs, total).
 
     Join is one trip; admin listing always wants the company name/domain
-    alongside each contact row.
+    alongside each contact row. `invalid_only` filters to invalidated contacts
+    (bounced / flagged) for the admin "review & delete" view.
     """
     base = select(Contact, Company).join(Company, Contact.company_id == Company.id)
     count_base = select(func.count()).select_from(Contact).join(
         Company, Contact.company_id == Company.id
     )
+
+    if invalid_only:
+        base = base.where(Contact.is_invalid.is_(True))
+        count_base = count_base.where(Contact.is_invalid.is_(True))
 
     if company_domain:
         base = base.where(Company.domain == company_domain.lower().strip())

@@ -32,7 +32,8 @@ from sqlalchemy.orm import Session as OrmSession
 from app.core.time import ensure_utc
 from app.logging_config import get_logger
 from app.models import Contact, SendQueue, TodayBatchItem, User
-from app.services import gmail_reply_fetcher
+from app.repositories import contacts as contacts_repo
+from app.services import email_patterns, gmail_reply_fetcher
 from app.services import locks as locks_svc
 from app.services.explicit_stop import is_explicit_stop
 from app.services.google_oauth import OAuthError, get_user_credentials
@@ -189,26 +190,53 @@ def _handle_bounce(
         log.warning("reply_ingestor.bounce_contact_missing", send_queue_id=sq.id)
         return
 
-    contact.is_invalid = True
-    db.add(contact)
-
+    # SCRAPER path only: a scraped address is a GUESS, so on bounce try the next
+    # guess pattern (firstname.lastname → firstname → …) instead of giving up.
+    # CSV/manually-curated contacts (no scraped_pattern) are assumed real — they
+    # skip this and get invalidated for admin review.
     if contact.scraped_pattern:
-        # Scraper hook: this guessed address bounced — the scraper should retry
-        # with an alternate pattern. (Generation lands with the scraper.)
+        nxt = email_patterns.next_guess(
+            contact.name, sq.company_domain or "", contact.scraped_pattern
+        )
+        if nxt is not None:
+            next_pattern, next_email = nxt
+            # Don't collide with an existing contact's address.
+            if contacts_repo.get_by_email(db, next_email) is None:
+                contact.email = next_email
+                contact.scraped_pattern = next_pattern
+                contact.email_verified = False
+                contact.is_invalid = False  # fresh guess — keep it in rotation
+                contact.invalid_reason = None
+                db.add(contact)
+                log.info(
+                    "reply_ingestor.scraped_pattern_advanced",
+                    contact_id=contact.id,
+                    company_domain=sq.company_domain,
+                    next_pattern=next_pattern,
+                )
+                return
+        # Exhausted all patterns (or every next guess collided) → give up.
+        contact.is_invalid = True
+        contact.invalid_reason = "bounce_patterns_exhausted"
+        db.add(contact)
         log.info(
-            "reply_ingestor.scraped_contact_bounced",
-            user_id=user.id,
+            "reply_ingestor.scraped_patterns_exhausted",
             contact_id=contact.id,
             company_domain=sq.company_domain,
-            scraped_pattern=contact.scraped_pattern,
         )
-    else:
-        log.info(
-            "reply_ingestor.contact_bounced_invalidated",
-            user_id=user.id,
-            contact_id=contact.id,
-            company_domain=sq.company_domain,
-        )
+        return
+
+    # CSV / manual contact: assumed real, so a bounce means the address is dead.
+    # Invalidate (leaves every user's pool) + flag for admin review/delete.
+    contact.is_invalid = True
+    contact.invalid_reason = "bounce"
+    db.add(contact)
+    log.info(
+        "reply_ingestor.contact_bounced_invalidated",
+        user_id=user.id,
+        contact_id=contact.id,
+        company_domain=sq.company_domain,
+    )
 
 
 def _empty_counters() -> dict[str, int]:

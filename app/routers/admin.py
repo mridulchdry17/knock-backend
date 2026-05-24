@@ -263,11 +263,15 @@ def list_contacts(
     page: Annotated[PaginationParams, Depends(pagination)],
     search: str | None = None,
     company_domain: str | None = None,
+    invalid_only: bool = False,
 ) -> Page[AdminContactOut]:
+    """`invalid_only=true` returns just the invalidated contacts (bounced /
+    flagged) — backs the admin 'these bounced, review & delete' view."""
     pairs, total = contacts_repo.list_admin_paginated(
         db,
         search=search,
         company_domain=company_domain,
+        invalid_only=invalid_only,
         limit=page.limit,
         offset=page.offset,
     )
@@ -285,6 +289,7 @@ def list_contacts(
             notes=c.notes,
             scraped_pattern=c.scraped_pattern,
             is_invalid=c.is_invalid,
+            invalid_reason=c.invalid_reason,
             created_at=c.created_at,
         )
         for c, co in pairs

@@ -20,6 +20,9 @@ class Contact(Base, CreatedAtMixin):
     email_confidence: Mapped[int | None] = mapped_column(Integer)
     email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_invalid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Why the contact was invalidated, e.g. "bounce" — lets the admin dashboard
+    # surface "this address bounced, delete it?" vs other invalid reasons.
+    invalid_reason: Mapped[str | None] = mapped_column(String(32))
     linkedin_url: Mapped[str | None] = mapped_column(String(512))
     # Set by future scraper to record which guess pattern produced this address
     # (e.g. "firstname.lastname"). Used by B5.5 to try an alternate pattern on
