@@ -19,12 +19,14 @@ from app.models import Company, Contact, TodayBatchItem
 from app.repositories import today_batch as today_repo
 from app.schemas.today import (
     RecipientOut,
+    SendBatchResultOut,
+    SkipTodayResultOut,
     TodayBatchOut,
     TodayItemOut,
     UpdateItemIn,
 )
 from app.services import batch_generator as batch_gen_svc
-from app.services import send_caps
+from app.services import send_caps, send_worker
 
 router = APIRouter(
     prefix="/api/v1/today",
@@ -265,3 +267,74 @@ def update_today_item(
 
     out = _hydrate(db, [item])
     return out[0]
+
+
+@router.post("/send-batch", response_model=SendBatchResultOut)
+def send_batch(user: CurrentUser, db: DbDep) -> SendBatchResultOut:
+    """Manual "Send today's batch" — the skip-then-send model.
+
+    Every non-skipped card in today's batch is sendable. We promote any
+    'default' card to 'ready' (the user reviewing the page and hitting Send
+    IS the approval — there's no separate mark-ready step) and then drain
+    this user's ready items immediately, ignoring the staggered send_time
+    slots. Autopilot keeps the staggered schedule; manual = send now.
+
+    'skipped' / 'sent' / 'failed' cards are left untouched. Idempotent: a
+    second call after everything's sent dispatches zero.
+    """
+    today = utcnow().date()
+    items = today_repo.list_for_user_date(db, user.id, today)
+
+    sendable = [i for i in items if i.status in ("default", "ready")]
+    for item in sendable:
+        if item.status == "default":
+            item.status = "ready"
+            db.add(item)
+    db.commit()
+
+    summary = send_worker.drain_due_items(
+        db, user_id=user.id, ignore_schedule=True
+    )
+
+    log.info(
+        "today.send_batch",
+        user_id=user.id,
+        sendable=len(sendable),
+        dispatched=summary.sent,
+        failed=summary.failed,
+        skipped=summary.skipped,
+    )
+
+    # The frontend shows "Sending N — first at HH:MM, last at HH:MM". For the
+    # manual path everything goes out now, so first/last collapse to ~now; we
+    # still report the planned slots' span when present for an honest window.
+    times = [i.send_time for i in sendable] or [utcnow()]
+    return SendBatchResultOut(
+        dispatched_count=summary.sent,
+        scheduled_first_at=ensure_utc(min(times)),
+        scheduled_last_at=ensure_utc(max(times)),
+    )
+
+
+@router.post("/skip", response_model=SkipTodayResultOut)
+def skip_today(user: CurrentUser, db: DbDep) -> SkipTodayResultOut:
+    """Skip the whole day — the user opts out of today's batch entirely.
+
+    Flips every still-pending card ('default' / 'ready') to 'skipped'. Cards
+    already 'sent' / 'failed' are terminal and left as-is. The frontend then
+    transitions to the limit-reached empty state. Idempotent: re-calling with
+    nothing pending flips zero rows and still returns skipped=true.
+    """
+    today = utcnow().date()
+    items = today_repo.list_for_user_date(db, user.id, today)
+
+    skipped = 0
+    for item in items:
+        if item.status in ("default", "ready"):
+            item.status = "skipped"
+            db.add(item)
+            skipped += 1
+    db.commit()
+
+    log.info("today.skip_today", user_id=user.id, skipped=skipped)
+    return SkipTodayResultOut(skipped=True)

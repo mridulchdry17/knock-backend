@@ -259,6 +259,195 @@ def test_patch_explicit_status_wins_over_edit_auto_ready(
     assert r.json()["status"] == "default"
 
 
+# ─────────────────────────── POST /today/send-batch ───────────────────────────
+
+
+def _stub_send_ok():
+    """Patch gmail_send.send_email + creds so drain_due_items "sends" cleanly.
+
+    Module-level patches, so they apply regardless of which DB session the
+    router uses internally.
+    """
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    from app.services import gmail_send, send_worker
+
+    stack = ExitStack()
+    stack.enter_context(
+        patch.object(
+            gmail_send,
+            "send_email",
+            return_value=gmail_send.SendResult(
+                ok=True, gmail_message_id="m", gmail_thread_id="t"
+            ),
+        )
+    )
+    stack.enter_context(
+        patch.object(send_worker, "get_user_credentials", return_value=object())
+    )
+    return stack
+
+
+def test_send_batch_dispatches_non_skipped_items(
+    client_factory, db: Session, free_user: User
+) -> None:
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+
+    with _stub_send_ok():
+        r = client.post("/api/v1/today/send-batch")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) >= {
+        "dispatched_count",
+        "scheduled_first_at",
+        "scheduled_last_at",
+    }
+    assert body["dispatched_count"] == 3
+
+    # All three cards transitioned to 'sent'.
+    from app.repositories import today_batch as today_repo
+
+    db.expire_all()
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    assert sorted(i.status for i in items) == ["sent", "sent", "sent"]
+    # sent_today bumped.
+    assert db.get(User, free_user.id).sent_today == 3
+
+
+def test_send_batch_leaves_skipped_items_untouched(
+    client_factory, db: Session, free_user: User
+) -> None:
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    from app.repositories import today_batch as today_repo
+
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    items[0].status = "skipped"
+    db.add(items[0])
+    db.commit()
+
+    client = client_factory(free_user)
+    with _stub_send_ok():
+        r = client.post("/api/v1/today/send-batch")
+
+    assert r.status_code == 200
+    assert r.json()["dispatched_count"] == 2
+
+    db.expire_all()
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    statuses = sorted(i.status for i in items)
+    assert statuses == ["sent", "sent", "skipped"]
+
+
+def test_send_batch_is_idempotent(
+    client_factory, db: Session, free_user: User
+) -> None:
+    _seed_pool(db, n=2)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+
+    with _stub_send_ok():
+        first = client.post("/api/v1/today/send-batch")
+        second = client.post("/api/v1/today/send-batch")
+
+    assert first.json()["dispatched_count"] == 2
+    # Everything already sent → nothing to dispatch on the second call.
+    assert second.json()["dispatched_count"] == 0
+
+
+def test_send_batch_with_no_batch_dispatches_zero(
+    client_factory, free_user: User
+) -> None:
+    # No batch generated → GET would lazy-gen, but send-batch reads whatever
+    # exists. With no contacts seeded there's nothing to send.
+    client = client_factory(free_user)
+    with _stub_send_ok():
+        r = client.post("/api/v1/today/send-batch")
+    assert r.status_code == 200
+    assert r.json()["dispatched_count"] == 0
+
+
+def test_send_batch_requires_auth(client_factory) -> None:
+    client = client_factory(None)
+    r = client.post("/api/v1/today/send-batch")
+    assert r.status_code == 401
+
+
+# ─────────────────────────── POST /today/skip ───────────────────────────
+
+
+def test_skip_today_flips_all_pending_to_skipped(
+    client_factory, db: Session, free_user: User
+) -> None:
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+
+    r = client.post("/api/v1/today/skip")
+    assert r.status_code == 200
+    assert r.json() == {"skipped": True}
+
+    from app.repositories import today_batch as today_repo
+
+    db.expire_all()
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    assert all(i.status == "skipped" for i in items)
+
+
+def test_skip_today_leaves_sent_cards_untouched(
+    client_factory, db: Session, free_user: User
+) -> None:
+    _seed_pool(db, n=2)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    from app.repositories import today_batch as today_repo
+
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    items[0].status = "sent"
+    db.add(items[0])
+    db.commit()
+
+    client = client_factory(free_user)
+    r = client.post("/api/v1/today/skip")
+    assert r.status_code == 200
+
+    db.expire_all()
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    assert sorted(i.status for i in items) == ["sent", "skipped"]
+
+
+def test_skip_today_is_idempotent(
+    client_factory, db: Session, free_user: User
+) -> None:
+    _seed_pool(db, n=2)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+    assert client.post("/api/v1/today/skip").json() == {"skipped": True}
+    # Second call: nothing pending, still succeeds.
+    assert client.post("/api/v1/today/skip").json() == {"skipped": True}
+
+
+def test_skip_today_requires_auth(client_factory) -> None:
+    client = client_factory(None)
+    r = client.post("/api/v1/today/skip")
+    assert r.status_code == 401
+
+
 # ─────────────────────────── admin manual trigger ───────────────────────────
 
 

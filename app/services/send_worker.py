@@ -186,22 +186,30 @@ def _record_success(
 
 
 def drain_due_items(
-    db: OrmSession, *, now: datetime | None = None
+    db: OrmSession,
+    *,
+    now: datetime | None = None,
+    user_id: int | None = None,
+    ignore_schedule: bool = False,
 ) -> DrainSummary:
-    """Process every 'ready' today_batch_item whose send_time <= now."""
+    """Process 'ready' today_batch_items and send them.
+
+    Defaults (scheduler/autopilot path): every user's 'ready' item whose
+    send_time <= now. `user_id` scopes to one user; `ignore_schedule=True`
+    drops the send_time gate (the manual "Send today's batch" path, where the
+    user explicitly chose to send now regardless of the staggered slot).
+    """
     now = now or utcnow()
     summary = DrainSummary()
 
     # Read the due-set in one query, oldest first. We don't hold a transaction
     # across the iteration — each item runs in its own commit boundary.
-    due = list(
-        db.scalars(
-            select(TodayBatchItem)
-            .where(TodayBatchItem.status == "ready")
-            .where(TodayBatchItem.send_time <= now)
-            .order_by(TodayBatchItem.send_time.asc())
-        ).all()
-    )
+    query = select(TodayBatchItem).where(TodayBatchItem.status == "ready")
+    if user_id is not None:
+        query = query.where(TodayBatchItem.user_id == user_id)
+    if not ignore_schedule:
+        query = query.where(TodayBatchItem.send_time <= now)
+    due = list(db.scalars(query.order_by(TodayBatchItem.send_time.asc())).all())
 
     for item in due:
         summary.attempted += 1

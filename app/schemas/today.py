@@ -65,6 +65,22 @@ class UpdateItemIn(BaseModel):
     template_id: int | None = None
 
 
+class SendBatchResultOut(BaseModel):
+    """Response for POST /today/send-batch. Matches the F.5b frontend contract
+    (BatchDispatchResultSchema)."""
+
+    dispatched_count: int
+    scheduled_first_at: datetime
+    scheduled_last_at: datetime
+
+
+class SkipTodayResultOut(BaseModel):
+    """Response for POST /today/skip. Matches the frontend SkipTodayResultSchema
+    ({ skipped: true })."""
+
+    skipped: Literal[True] = True
+
+
 class AdminCronRunResultItemOut(BaseModel):
     user_id: int
     items_created: int
