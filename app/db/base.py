@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from sqlalchemy import event
@@ -71,8 +72,68 @@ def _patch_libsql_dialect_for_turso() -> None:
     SQLiteDialect_libsql._knock_isolation_patched = True  # type: ignore[attr-defined]
 
 
+def _use_embedded_replica() -> bool:
+    """Embedded-replica mode is on when DATABASE_URL is libsql AND a writable
+    LIBSQL_REPLICA_PATH is configured. Off by default → talk to remote directly."""
+    return _is_libsql(settings.DATABASE_URL) and bool(settings.LIBSQL_REPLICA_PATH)
+
+
+def _build_embedded_replica_engine() -> Engine:
+    """Engine backed by a local SQLite replica that syncs from the Turso primary.
+
+    Reads hit the local file (microseconds); writes are forwarded to the remote
+    primary by the libsql driver; the replica pulls changes every
+    LIBSQL_SYNC_INTERVAL seconds. We override connection *creation* with a
+    `creator` (the dialect's URL parser doesn't know about replica mode) but
+    keep the libsql dialect for SQL compilation.
+
+    NOTE: each pooled connection is its own replica handle against the same
+    local file, each running its own background sync. Validated single-process;
+    load-test concurrency before relying on it under heavy parallel traffic.
+    """
+    import libsql_experimental as libsql
+    from sqlalchemy import create_engine
+
+    _patch_libsql_dialect_for_turso()
+
+    parts = urlsplit(settings.DATABASE_URL)
+    sync_url = f"https://{parts.netloc}"
+    _, ca = _split_libsql_url(settings.DATABASE_URL)
+    auth_token = ca.get("auth_token")
+    replica_path = settings.LIBSQL_REPLICA_PATH
+    sync_interval = settings.LIBSQL_SYNC_INTERVAL
+
+    def _creator():  # type: ignore[no-untyped-def]
+        conn = libsql.connect(
+            replica_path,
+            sync_url=sync_url,
+            auth_token=auth_token,
+            sync_interval=sync_interval,
+            check_same_thread=False,
+        )
+        # Pull the latest frames once on connect so a fresh connection never
+        # serves a stale/empty local file before the first background sync.
+        with contextlib.suppress(Exception):  # sync hiccup must not block startup
+            conn.sync()
+        return conn
+
+    return create_engine(
+        "sqlite+libsql://",  # dialect only; `creator` builds the real connection
+        creator=_creator,
+        echo=settings.DB_ECHO,
+        future=True,
+        poolclass=QueuePool,
+        pool_size=5,
+        max_overflow=10,
+        isolation_level="AUTOCOMMIT",
+    )
+
+
 def _build_engine() -> Engine:
     from sqlalchemy import create_engine
+
+    if _use_embedded_replica():
+        return _build_embedded_replica_engine()
 
     url = settings.DATABASE_URL
     connect_args: dict[str, object] = {}

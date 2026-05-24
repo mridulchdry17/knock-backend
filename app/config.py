@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./db/outreach.db"
     DB_ECHO: bool = False
 
+    # Turso embedded replica (perf). When set to a writable file path AND
+    # DATABASE_URL is a libsql:// URL, the app keeps a LOCAL SQLite replica at
+    # this path: reads come from local disk (microseconds), writes forward to
+    # the remote Turso primary, and the replica pulls changes every
+    # LIBSQL_SYNC_INTERVAL seconds. Empty = disabled (talk to remote directly,
+    # current behavior). Off by default — enable on the single-process VM only.
+    LIBSQL_REPLICA_PATH: str = ""
+    LIBSQL_SYNC_INTERVAL: int = 30
+
     FRONTEND_ORIGIN: str = "http://localhost:3000"
     ALLOWED_ORIGINS: str = "http://localhost:3000"
 
