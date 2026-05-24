@@ -240,8 +240,12 @@ def test_platform_permanent_lock_blocks_company(db: Session, free_user: User) ->
 
 def test_global_cooldown_blocks_company(db: Session, free_user: User) -> None:
     companies = _seed_n_companies_with_contacts(db, n=2)
+    # A platform-wide cooldown exists on companies[0]. Attribution is nullable
+    # (SET NULL) and the picker keys off company_domain + locked_until, not who
+    # set it, so leave last_locked_by_user_id unset rather than referencing a
+    # non-existent user id (which a real FK now correctly rejects).
     locks_repo.upsert_global_lock(
-        db, companies[0].domain, locked_by_user_id=999, lock_duration_hours=36
+        db, companies[0].domain, locked_by_user_id=None, lock_duration_hours=36
     )
     db.commit()
 

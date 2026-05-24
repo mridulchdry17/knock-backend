@@ -70,4 +70,9 @@ class SendQueue(Base, CreatedAtMixin):
     __table_args__ = (
         Index("idx_queue_due", "status", "scheduled_for"),
         Index("idx_queue_user_status", "user_id", "status"),
+        # B5.6 reply matching looks up the most recent send on an inbound thread
+        # via WHERE user_id = ? AND gmail_thread_id = ? ORDER BY sent_at DESC
+        # (see reply_ingestor._match_send_for_reply). Without this the lookup is
+        # a full scan of an append-only, ever-growing table.
+        Index("idx_queue_user_thread", "user_id", "gmail_thread_id"),
     )

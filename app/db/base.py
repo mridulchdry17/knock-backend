@@ -8,6 +8,9 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from app.config import settings
+from app.logging_config import get_logger
+
+log = get_logger("db")
 
 # Recycle pooled libsql connections this many seconds after creation. Must stay
 # safely BELOW Turso's Hrana idle-stream TTL (~10s) so we never check out a
@@ -134,6 +137,21 @@ def _build_engine() -> Engine:
             cur.execute("PRAGMA foreign_keys=ON")
             cur.execute("PRAGMA busy_timeout=5000")
             cur.close()
+    elif _is_libsql(settings.DATABASE_URL):
+        @event.listens_for(eng, "connect")
+        def _libsql_pragmas(dbapi_conn, _):  # type: ignore[no-untyped-def]
+            # SQLite/libSQL default foreign_keys=OFF, so every ondelete=CASCADE /
+            # SET NULL in the models is silently a no-op on Turso unless we enable
+            # it per connection. Hrana rejects some PRAGMAs with HTTP 405 (see
+            # _patch_libsql_dialect_for_turso for read_uncommitted) — foreign_keys
+            # may be one of them — so attempt it defensively. A rejection must NOT
+            # fail connection setup; worst case FKs stay off, exactly as before.
+            try:
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA foreign_keys=ON")
+                cur.close()
+            except Exception as exc:  # pragma: no cover — depends on Turso server
+                log.warning("libsql.foreign_keys_pragma_failed", error=str(exc))
 
     return eng
 

@@ -23,7 +23,7 @@ os.environ.setdefault("SUPER_ADMIN_EMAILS", "")
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -62,6 +62,17 @@ def engine() -> Iterator[Engine]:
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+    # Enforce foreign keys in tests so cascade/SET NULL behaviour and FK
+    # violations are actually exercised in CI (SQLite defaults this OFF). This
+    # mirrors the local-dev engine in app/db/base.py and is at least as strict
+    # as production, where we now attempt the same PRAGMA on libsql connect.
+    @event.listens_for(eng, "connect")
+    def _fk_on(dbapi_conn, _):  # type: ignore[no-untyped-def]
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
     Base.metadata.create_all(eng)
     try:
         yield eng
