@@ -225,6 +225,83 @@ def test_waitlist_csv_export(client_factory, db: Session, super_admin: User) -> 
     assert "y@z.com" in body
 
 
+# ─────────────────────────── waitlist approve / revoke ───────────────────────────
+
+
+def test_approve_waitlist_entry_stamps_approved_at(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    entry = waitlist_repo.add(db, "invitee@example.com")
+    db.commit()
+    assert entry.approved_at is None
+
+    client = client_factory(super_admin)
+    r = client.post(f"/api/v1/admin/waitlist/{entry.id}/approve")
+    assert r.status_code == 200
+    assert r.json()["approved_at"] is not None
+
+    db.expire_all()
+    assert waitlist_repo.get(db, entry.id).approved_at is not None
+
+
+def test_approve_waitlist_promotes_linked_pending_user(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """If the person already signed in and is sitting at 'pending', approving
+    their waitlist entry bumps them to 'free' on the spot."""
+    entry = waitlist_repo.add(db, "tester@example.com")
+    db.commit()
+    user = _make_user(
+        db,
+        email="tester@example.com",
+        google_sub="g-tester",
+        tier="pending",
+        waitlist_email="tester@example.com",
+    )
+
+    client = client_factory(super_admin)
+    r = client.post(f"/api/v1/admin/waitlist/{entry.id}/approve")
+    assert r.status_code == 200
+
+    db.expire_all()
+    assert db.get(User, user.id).tier == "free"
+
+
+def test_revoke_waitlist_entry_clears_and_downgrades_free_user(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    entry = waitlist_repo.add(db, "revoked@example.com")
+    waitlist_repo.set_approved(db, entry, approved=True)
+    db.commit()
+    user = _make_user(
+        db,
+        email="revoked@example.com",
+        google_sub="g-rev",
+        tier="free",
+        waitlist_email="revoked@example.com",
+    )
+
+    client = client_factory(super_admin)
+    r = client.post(f"/api/v1/admin/waitlist/{entry.id}/revoke")
+    assert r.status_code == 200
+    assert r.json()["approved_at"] is None
+
+    db.expire_all()
+    assert waitlist_repo.get(db, entry.id).approved_at is None
+    assert db.get(User, user.id).tier == "pending"
+
+
+def test_approve_waitlist_unknown_entry_404(client_factory, super_admin: User) -> None:
+    client = client_factory(super_admin)
+    assert client.post("/api/v1/admin/waitlist/99999/approve").status_code == 404
+
+
+def test_approve_waitlist_requires_super_admin(client_factory, db: Session) -> None:
+    user = _make_user(db, email="free@x.com", google_sub="g-f", tier="free")
+    client = client_factory(user)
+    assert client.post("/api/v1/admin/waitlist/1/approve").status_code == 403
+
+
 # ─────────────────────────── pagination bounds ───────────────────────────
 
 

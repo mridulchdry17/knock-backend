@@ -58,7 +58,16 @@ def claim_waitlist(
             "That waitlist email is already linked to another account.",
             status_code=status.HTTP_409_CONFLICT,
         )
-    log.info("onboarding.claim_ok", user_id=user.id, claimed=payload.email)
+    # OK (approved → now free) or PENDING_APPROVAL (linked, still awaiting an
+    # admin allow). Both return the user's current status; the frontend routes
+    # by tier (free → /today, pending → /awaiting-approval).
+    log.info(
+        "onboarding.claimed",
+        user_id=user.id,
+        claimed=payload.email,
+        result=result.value,
+        tier=user.tier,
+    )
     return OnboardingStatusOut(
         tier=user.tier,
         waitlist_email=user.waitlist_email,

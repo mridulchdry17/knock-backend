@@ -92,11 +92,25 @@ def db(engine: Engine) -> Iterator[Session]:
 
 @pytest.fixture
 def waitlist_email(db: Session) -> str:
-    """Seeds one waitlist entry; returns the email."""
+    """Seeds one UN-approved waitlist entry; returns the email. Being on the
+    list no longer grants access — a super_admin must approve it."""
     from app.repositories import waitlist as waitlist_repo
 
     email = "founder@startup.com"
     waitlist_repo.add(db, email)
+    db.commit()
+    return email
+
+
+@pytest.fixture
+def approved_waitlist_email(db: Session) -> str:
+    """Seeds an APPROVED waitlist entry; returns the email. This is the only
+    state that auto-grants tier='free'."""
+    from app.repositories import waitlist as waitlist_repo
+
+    email = "approved@startup.com"
+    entry = waitlist_repo.add(db, email)
+    waitlist_repo.set_approved(db, entry, approved=True)
     db.commit()
     return email
 

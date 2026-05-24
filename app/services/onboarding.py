@@ -22,7 +22,8 @@ from app.repositories import waitlist as waitlist_repo
 
 
 class ClaimResult(StrEnum):
-    OK = "ok"
+    OK = "ok"  # email is on the waitlist AND approved → user is now 'free'
+    PENDING_APPROVAL = "pending_approval"  # on the waitlist, not allowed in yet
     NOT_FOUND = "not_found"
     TAKEN = "taken"
 
@@ -30,14 +31,21 @@ class ClaimResult(StrEnum):
 def claim_waitlist(db: OrmSession, user: User, claimed_email: str) -> ClaimResult:
     """User asserts they signed up to the waitlist with a different email earlier.
 
-      - Email not on waitlist          → NOT_FOUND.
-      - Email on waitlist, free        → set users.waitlist_email + tier='free'. OK.
-      - Email on waitlist, but already claimed by another user → TAKEN.
-      - User re-claims their own already-claimed email → OK (idempotent).
+      - Email not on waitlist                       → NOT_FOUND.
+      - Email already claimed by another user       → TAKEN.
+      - Email on waitlist + approved                → link it + tier='free'. OK.
+      - Email on waitlist but NOT approved yet       → link it, tier='pending'.
+                                                       PENDING_APPROVAL.
+      - User re-claims their own email              → idempotent (OK or
+                                                       PENDING_APPROVAL by status).
+
+    Claiming always *links* the waitlist row to this account (so the admin can
+    find and approve them), but access is only granted if the entry is approved.
     """
     target = normalize_email(claimed_email)
 
-    if not waitlist_repo.exists(db, target):
+    entry = waitlist_repo.get_by_email(db, target)
+    if entry is None:
         return ClaimResult.NOT_FOUND
 
     existing_holder = users_repo.get_by_waitlist_email(db, target)
@@ -45,9 +53,25 @@ def claim_waitlist(db: OrmSession, user: User, claimed_email: str) -> ClaimResul
         return ClaimResult.TAKEN
 
     users_repo.set_waitlist_email(db, user, target)
-    users_repo.set_tier(db, user, "free")
+
+    if entry.approved_at is not None:
+        users_repo.set_tier(db, user, "free")
+        _seed_starters_safely(db, user)
+        db.commit()
+        return ClaimResult.OK
+
+    # On the list, but a super_admin hasn't allowed this entry in yet.
+    users_repo.set_tier(db, user, "pending")
     db.commit()
-    return ClaimResult.OK
+    return ClaimResult.PENDING_APPROVAL
+
+
+def _seed_starters_safely(db: OrmSession, user: User) -> None:
+    """Seed the 3 starter templates when a user reaches an active tier. Lazy
+    import keeps onboarding light and avoids a circular import with templates."""
+    from app.services import templates as templates_svc
+
+    templates_svc.seed_starters(db, user)
 
 
 def join_waitlist(db: OrmSession, user: User) -> None:
