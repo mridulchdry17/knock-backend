@@ -5,8 +5,11 @@ Why a thin adapter:
   - Error classification lives in ONE place, so the dashboard's failure_kind
     taxonomy stays consistent.
 
-MIME: text/plain only for v0 (no HTML). We still wrap in multipart/alternative
-so a later HTML add-on is additive (just .add_alternative on the message).
+MIME: text/plain only. The body may arrive as rich-text HTML (the template
+editor serializes via getHTML()), so build_mime flattens it with html_to_text
+before set_content — a personal plain-text note lands better for cold student
+outreach than an HTML email. A future HTML variant would be additive
+(.add_alternative on the message).
 """
 from __future__ import annotations
 
@@ -19,6 +22,8 @@ from typing import TYPE_CHECKING, Any
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+from app.services.html_to_text import html_to_text
 
 if TYPE_CHECKING:
     from google.oauth2.credentials import Credentials
@@ -76,7 +81,11 @@ def build_mime(
         msg["Cc"] = ", ".join(cc_emails)
     msg["Subject"] = subject
 
-    msg.set_content(body_text)
+    # Safety net: render_template already flattens HTML, but a body that was
+    # stored as HTML before this shipped (or any path that bypasses render)
+    # would otherwise reach the recipient with literal <p>…</p> tags, since
+    # the message is text/plain. Idempotent on already-plain text.
+    msg.set_content(html_to_text(body_text))
     return msg
 
 

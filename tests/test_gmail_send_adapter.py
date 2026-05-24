@@ -87,6 +87,23 @@ def test_build_mime_no_sender_name_uses_bare_email() -> None:
     assert parsed["From"] == "alice@example.com"
 
 
+def test_build_mime_flattens_html_body_to_plain_text() -> None:
+    # Safety net: a body stored as HTML before the render-time flatten shipped
+    # must still reach the recipient as plain text, not literal <p> tags.
+    msg = gmail_send.build_mime(
+        sender_email="alice@example.com",
+        sender_name=None,
+        to_email="bob@acme.com",
+        cc_emails=[],
+        subject="s",
+        body_text="<p>Hi Alex,</p><p>Best,<br>Mridul</p>",
+    )
+    payload = _decode_to_message(msg).get_payload()
+    assert "<p>" not in payload and "</p>" not in payload and "<br>" not in payload
+    assert "Hi Alex," in payload
+    assert "Best,\nMridul" in payload
+
+
 def test_encode_for_gmail_is_base64url() -> None:
     msg = gmail_send.build_mime(
         sender_email="a@x.com",
