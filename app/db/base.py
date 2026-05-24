@@ -87,9 +87,12 @@ def _build_embedded_replica_engine() -> Engine:
     `creator` (the dialect's URL parser doesn't know about replica mode) but
     keep the libsql dialect for SQL compilation.
 
-    NOTE: each pooled connection is its own replica handle against the same
-    local file, each running its own background sync. Validated single-process;
-    load-test concurrency before relying on it under heavy parallel traffic.
+    Sync strategy (the important part): we sync ONCE at startup to populate the
+    local file, then connections do NOT sync on open — they just read the local
+    file, and each connection's background `sync_interval` keeps it fresh. An
+    earlier version synced on EVERY connection open, which serialized under
+    concurrent requests (5 page-load fetches → 5 simultaneous blocking syncs →
+    multi-second stalls). Reads must never block on a network sync.
     """
     import libsql_experimental as libsql
     from sqlalchemy import create_engine
@@ -103,23 +106,27 @@ def _build_embedded_replica_engine() -> Engine:
     replica_path = settings.LIBSQL_REPLICA_PATH
     sync_interval = settings.LIBSQL_SYNC_INTERVAL
 
-    def _creator():  # type: ignore[no-untyped-def]
-        conn = libsql.connect(
+    def _connect():  # type: ignore[no-untyped-def]
+        return libsql.connect(
             replica_path,
             sync_url=sync_url,
             auth_token=auth_token,
             sync_interval=sync_interval,
             check_same_thread=False,
         )
-        # Pull the latest frames once on connect so a fresh connection never
-        # serves a stale/empty local file before the first background sync.
-        with contextlib.suppress(Exception):  # sync hiccup must not block startup
-            conn.sync()
-        return conn
+
+    # ONE-TIME startup sync: populate/freshen the local file before serving so a
+    # cold start (or brand-new machine with no file yet) never reads empty data.
+    # After this, connections never sync on open — the background sync_interval
+    # alone keeps the copy current. This is the single blocking sync; it happens
+    # once at boot, not per request.
+    with contextlib.suppress(Exception):  # a sync hiccup must not block startup
+        boot = _connect()
+        boot.sync()
 
     return create_engine(
         "sqlite+libsql://",  # dialect only; `creator` builds the real connection
-        creator=_creator,
+        creator=_connect,  # NO sync on open — read local, background timer refreshes
         echo=settings.DB_ECHO,
         future=True,
         poolclass=QueuePool,
