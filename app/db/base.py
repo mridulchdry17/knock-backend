@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
-from sqlalchemy import event
+from sqlalchemy import Delete, Insert, Update, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.orm import Session as SaSession
 from sqlalchemy.pool import QueuePool
 
 from app.config import settings
@@ -15,8 +18,7 @@ log = get_logger("db")
 
 # Recycle pooled libsql connections this many seconds after creation. Must stay
 # safely BELOW Turso's Hrana idle-stream TTL (~10s) so we never check out a
-# connection whose server-side stream has already expired. Tunable if Turso
-# changes the TTL or we observe stale-stream errors creeping back.
+# connection whose server-side stream has already expired.
 LIBSQL_POOL_RECYCLE_SECONDS = 5
 
 
@@ -72,79 +74,36 @@ def _patch_libsql_dialect_for_turso() -> None:
     SQLiteDialect_libsql._knock_isolation_patched = True  # type: ignore[attr-defined]
 
 
-def _use_embedded_replica() -> bool:
-    """Embedded-replica mode is on when DATABASE_URL is libsql AND a writable
-    LIBSQL_REPLICA_PATH is configured. Off by default → talk to remote directly."""
-    return _is_libsql(settings.DATABASE_URL) and bool(settings.LIBSQL_REPLICA_PATH)
+def _attach_connect_pragmas(eng: Engine, url: str) -> None:
+    """Per-connection PRAGMAs. Local SQLite gets WAL + FK; remote libsql gets a
+    best-effort foreign_keys=ON (Hrana may reject it — must not fail setup)."""
+    if _is_local_sqlite(url):
+        @event.listens_for(eng, "connect")
+        def _sqlite_pragmas(dbapi_conn, _):  # type: ignore[no-untyped-def]
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.execute("PRAGMA busy_timeout=5000")
+            cur.close()
+    elif _is_libsql(url):
+        @event.listens_for(eng, "connect")
+        def _libsql_pragmas(dbapi_conn, _):  # type: ignore[no-untyped-def]
+            try:
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA foreign_keys=ON")
+                cur.close()
+            except Exception as exc:  # pragma: no cover — depends on Turso server
+                log.warning("libsql.foreign_keys_pragma_failed", error=str(exc))
 
 
-def _build_embedded_replica_engine() -> Engine:
-    """Engine backed by a local SQLite replica that syncs from the Turso primary.
-
-    Reads hit the local file (microseconds); writes are forwarded to the remote
-    primary by the libsql driver; the replica pulls changes every
-    LIBSQL_SYNC_INTERVAL seconds. We override connection *creation* with a
-    `creator` (the dialect's URL parser doesn't know about replica mode) but
-    keep the libsql dialect for SQL compilation.
-
-    Sync strategy (the important part): we sync ONCE at startup to populate the
-    local file, then connections do NOT sync on open — they just read the local
-    file, and each connection's background `sync_interval` keeps it fresh. An
-    earlier version synced on EVERY connection open, which serialized under
-    concurrent requests (5 page-load fetches → 5 simultaneous blocking syncs →
-    multi-second stalls). Reads must never block on a network sync.
-    """
-    import libsql_experimental as libsql
+def _build_single_engine(url: str) -> Engine:
+    """Build one engine for a URL: local SQLite file OR remote libsql (Turso).
+    This is the non-replica engine, and also serves as the WRITE engine in
+    read/write-split mode."""
     from sqlalchemy import create_engine
 
-    _patch_libsql_dialect_for_turso()
-
-    parts = urlsplit(settings.DATABASE_URL)
-    sync_url = f"https://{parts.netloc}"
-    _, ca = _split_libsql_url(settings.DATABASE_URL)
-    auth_token = ca.get("auth_token")
-    replica_path = settings.LIBSQL_REPLICA_PATH
-    sync_interval = settings.LIBSQL_SYNC_INTERVAL
-
-    def _connect():  # type: ignore[no-untyped-def]
-        return libsql.connect(
-            replica_path,
-            sync_url=sync_url,
-            auth_token=auth_token,
-            sync_interval=sync_interval,
-            check_same_thread=False,
-        )
-
-    # ONE-TIME startup sync: populate/freshen the local file before serving so a
-    # cold start (or brand-new machine with no file yet) never reads empty data.
-    # After this, connections never sync on open — the background sync_interval
-    # alone keeps the copy current. This is the single blocking sync; it happens
-    # once at boot, not per request.
-    with contextlib.suppress(Exception):  # a sync hiccup must not block startup
-        boot = _connect()
-        boot.sync()
-
-    return create_engine(
-        "sqlite+libsql://",  # dialect only; `creator` builds the real connection
-        creator=_connect,  # NO sync on open — read local, background timer refreshes
-        echo=settings.DB_ECHO,
-        future=True,
-        poolclass=QueuePool,
-        pool_size=5,
-        max_overflow=10,
-        isolation_level="AUTOCOMMIT",
-    )
-
-
-def _build_engine() -> Engine:
-    from sqlalchemy import create_engine
-
-    if _use_embedded_replica():
-        return _build_embedded_replica_engine()
-
-    url = settings.DATABASE_URL
     connect_args: dict[str, object] = {}
-
     if _is_local_sqlite(url):
         connect_args["check_same_thread"] = False
     elif _is_libsql(url):
@@ -158,78 +117,160 @@ def _build_engine() -> Engine:
         connect_args=connect_args,
     )
     if _is_libsql(settings.DATABASE_URL):
-        # libsql remote (Hrana over HTTPS) doesn't speak the standard SQLite BEGIN/ROLLBACK
-        # transaction protocol. AUTOCOMMIT lets SQLAlchemy treat each statement as committed
-        # at the connection level; the ORM Session still groups writes via flush+commit, and
-        # the underlying connection autocommits them on dispatch.
+        # AUTOCOMMIT: libsql remote (Hrana) doesn't speak standard BEGIN/ROLLBACK.
         engine_kwargs["isolation_level"] = "AUTOCOMMIT"
-
-        # Hrana streams are stateful and the server TTL-expires them after a short
-        # idle window (~10s). We previously used NullPool to dodge stale-stream
-        # 404s ("stream not found: <id>") by opening a fresh connection per
-        # request — correct, but it pays a full TLS + Hrana handshake to the
-        # remote DB on EVERY request (~hundreds of ms each), which is the bulk
-        # of the per-request latency at v0.
-        #
-        # Switch to the default QueuePool with pool_recycle BELOW the Hrana idle
-        # TTL: a connection younger than LIBSQL_POOL_RECYCLE_SECONDS is reused
-        # (no handshake), anything older is transparently discarded + reopened on
-        # checkout — so we never hand a stale stream to a query. This makes
-        # bursty traffic (a page firing several queries, or back-to-back
-        # navigations) reuse one warm connection instead of N cold ones.
-        # pool_pre_ping stays on as a belt-and-suspenders for the rare race where
-        # the server kills a stream inside the recycle window.
-        # The libsql dialect defaults to SingletonThreadPool (one shared
-        # connection, no overflow knobs); force QueuePool so pool_size /
-        # max_overflow / pool_recycle apply.
+        # QueuePool + pool_recycle below Turso's Hrana idle TTL: reuse warm
+        # connections within a burst, discard+reopen stale ones on checkout.
         engine_kwargs["poolclass"] = QueuePool
         engine_kwargs["pool_recycle"] = LIBSQL_POOL_RECYCLE_SECONDS
         engine_kwargs["pool_size"] = 5
         engine_kwargs["max_overflow"] = 10
-
-        # Suppress the connection-return ROLLBACK. With AUTOCOMMIT isolation
-        # there is nothing to roll back; the dialect issues a `rollback()` on
-        # session close anyway, which then trips a fresh Hrana stream lookup on
-        # an already-dead stream and noisily 404s in the logs (see "Exception
-        # during reset or similar").
         engine_kwargs["pool_reset_on_return"] = None
 
     eng = create_engine(url, **engine_kwargs)
-
-    if _is_local_sqlite(settings.DATABASE_URL):
-        @event.listens_for(eng, "connect")
-        def _sqlite_pragmas(dbapi_conn, _):  # type: ignore[no-untyped-def]
-            cur = dbapi_conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL")
-            cur.execute("PRAGMA synchronous=NORMAL")
-            cur.execute("PRAGMA foreign_keys=ON")
-            cur.execute("PRAGMA busy_timeout=5000")
-            cur.close()
-    elif _is_libsql(settings.DATABASE_URL):
-        @event.listens_for(eng, "connect")
-        def _libsql_pragmas(dbapi_conn, _):  # type: ignore[no-untyped-def]
-            # SQLite/libSQL default foreign_keys=OFF, so every ondelete=CASCADE /
-            # SET NULL in the models is silently a no-op on Turso unless we enable
-            # it per connection. Hrana rejects some PRAGMAs with HTTP 405 (see
-            # _patch_libsql_dialect_for_turso for read_uncommitted) — foreign_keys
-            # may be one of them — so attempt it defensively. A rejection must NOT
-            # fail connection setup; worst case FKs stay off, exactly as before.
-            try:
-                cur = dbapi_conn.cursor()
-                cur.execute("PRAGMA foreign_keys=ON")
-                cur.close()
-            except Exception as exc:  # pragma: no cover — depends on Turso server
-                log.warning("libsql.foreign_keys_pragma_failed", error=str(exc))
-
+    _attach_connect_pragmas(eng, settings.DATABASE_URL)
     return eng
 
 
-engine: Engine = _build_engine()
+# ─────────────────────── read/write split (Turso embedded replica) ───────────────────────
+#
+# When LIBSQL_REPLICA_PATH is set we run a read/write split:
+#   - READS  → a pool of PLAIN local-file connections (no sync) → fast + concurrent.
+#   - WRITES → the remote Turso primary (source of truth).
+#   - ONE syncer connection keeps the local file fresh: an initial sync at boot,
+#     a background re-sync every LIBSQL_SYNC_INTERVAL, AND a sync right after each
+#     write (read-your-writes). ALL syncs serialized through one lock on one
+#     connection — the earlier crash (`wal_insert_begin failed`) came from
+#     MULTIPLE connections syncing the same file; here there is exactly one.
+# Off by default (empty path) → single remote engine, current behavior.
 
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    autocommit=False,
-    expire_on_commit=False,
-    future=True,
-)
+_READ_ENGINE: Engine | None = None
+_WRITE_ENGINE: Engine | None = None
+_syncer = None  # the single libsql syncer connection
+_sync_lock = threading.Lock()
+
+
+def _use_embedded_replica() -> bool:
+    return _is_libsql(settings.DATABASE_URL) and bool(settings.LIBSQL_REPLICA_PATH)
+
+
+def _build_local_read_engine() -> Engine:
+    """Pool of plain local-file connections (NO sync_url) — concurrent fast reads
+    of the replica file the syncer keeps fresh. Many readers are safe (WAL)."""
+    import libsql_experimental as libsql
+    from sqlalchemy import create_engine
+
+    _patch_libsql_dialect_for_turso()
+    replica_path = settings.LIBSQL_REPLICA_PATH
+
+    def _connect():  # type: ignore[no-untyped-def]
+        return libsql.connect(replica_path, check_same_thread=False)
+
+    return create_engine(
+        "sqlite+libsql://",  # dialect only; creator opens the local file
+        creator=_connect,
+        echo=settings.DB_ECHO,
+        future=True,
+        poolclass=QueuePool,
+        pool_size=10,
+        max_overflow=20,
+        isolation_level="AUTOCOMMIT",
+    )
+
+
+def trigger_sync() -> None:
+    """Pull remote → local. Serialized through _sync_lock on the single syncer
+    connection (one writer to the local WAL → no contention). Best-effort: a
+    sync hiccup must never break a request."""
+    if _syncer is None:
+        return
+    with contextlib.suppress(Exception), _sync_lock:
+        _syncer.sync()
+
+
+def _start_syncer() -> None:
+    """Open the single syncer, do a blocking initial sync (populate the file),
+    then a daemon thread re-syncs every LIBSQL_SYNC_INTERVAL."""
+    global _syncer
+    import libsql_experimental as libsql
+
+    parts = urlsplit(settings.DATABASE_URL)
+    sync_url = f"https://{parts.netloc}"
+    _, ca = _split_libsql_url(settings.DATABASE_URL)
+    auth_token = ca.get("auth_token")
+    interval = max(1, settings.LIBSQL_SYNC_INTERVAL)
+
+    # No sync_interval kwarg → we drive ALL syncs manually under the lock (the
+    # libsql background timer would be a second, unsynchronized syncer).
+    _syncer = libsql.connect(
+        settings.LIBSQL_REPLICA_PATH, sync_url=sync_url, auth_token=auth_token
+    )
+    with contextlib.suppress(Exception), _sync_lock:
+        _syncer.sync()  # one-time blocking populate before serving
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            trigger_sync()
+
+    threading.Thread(target=_loop, name="libsql-syncer", daemon=True).start()
+    log.info("db.replica_syncer_started", interval_s=interval)
+
+
+class RoutingSession(SaSession):
+    """Routes reads to the local replica engine and writes to the remote engine.
+
+    A flush, a Core INSERT/UPDATE/DELETE, OR any read AFTER this session has
+    already written (read-your-writes within the txn) → write engine. Plain
+    reads → local replica engine.
+    """
+
+    def get_bind(self, mapper=None, clause=None, **kw):  # type: ignore[override]
+        if (
+            self._flushing
+            or isinstance(clause, (Update, Insert, Delete))
+            or self.info.get("_wrote")
+        ):
+            return _WRITE_ENGINE
+        return _READ_ENGINE
+
+
+@event.listens_for(RoutingSession, "after_flush")
+def _mark_wrote(session, _flush_context):  # type: ignore[no-untyped-def]
+    # Once a session writes, route its later reads to the write engine so the
+    # request sees its own uncommitted changes.
+    session.info["_wrote"] = True
+
+
+@event.listens_for(RoutingSession, "after_commit")
+def _sync_after_write(session):  # type: ignore[no-untyped-def]
+    # After a committed write, pull it into the local replica so the NEXT
+    # request's local reads see it (read-your-writes across requests).
+    if session.info.pop("_wrote", False):
+        trigger_sync()
+
+
+# ─────────────────────────── wiring ───────────────────────────
+
+if _use_embedded_replica():
+    _WRITE_ENGINE = _build_single_engine(settings.DATABASE_URL)  # remote primary
+    _READ_ENGINE = _build_local_read_engine()  # local replica pool
+    _start_syncer()
+    engine: Engine = _WRITE_ENGINE  # migrations / metadata use the real primary
+    SessionLocal = sessionmaker(
+        class_=RoutingSession,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        future=True,
+    )
+    log.info("db.read_write_split_active", replica_path=settings.LIBSQL_REPLICA_PATH)
+else:
+    engine = _build_single_engine(settings.DATABASE_URL)
+    SessionLocal = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+        future=True,
+    )
