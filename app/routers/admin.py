@@ -180,6 +180,65 @@ def export_waitlist_csv(_admin: SuperAdminUser, db: DbDep) -> StreamingResponse:
     )
 
 
+def _set_waitlist_approval(db: DbDep, entry_id: int, *, approved: bool) -> AdminWaitlistOut:
+    """Allow (or revoke) a waitlist entry, and keep any already-linked account
+    in sync so the decision takes effect immediately — an approved tester
+    shouldn't have to sign in again to get unblocked."""
+    entry = waitlist_repo.get(db, entry_id)
+    if entry is None:
+        raise ApiError(
+            "not_found", "Waitlist entry not found.", status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    waitlist_repo.set_approved(db, entry, approved=approved)
+
+    # Find the account this entry belongs to (claimed via waitlist_email, or
+    # signed in with the same address) and sync its tier.
+    user = users_repo.get_by_waitlist_email(db, entry.email) or users_repo.get_by_email(
+        db, entry.email
+    )
+    if user is not None:
+        if approved and user.tier == "pending":
+            if user.waitlist_email != entry.email:
+                users_repo.set_waitlist_email(db, user, entry.email)
+            users_repo.set_tier(db, user, "free")
+            # Lazy import — avoid pulling the templates/Gmail graph at module load.
+            from app.services import templates as templates_svc
+
+            templates_svc.seed_starters(db, user)
+        elif not approved and user.tier == "free":
+            # Pull access back. Don't touch paid/super_admin tiers.
+            users_repo.set_tier(db, user, "pending")
+
+    db.commit()
+    log.info(
+        "admin.waitlist_approval",
+        entry_id=entry.id,
+        email=entry.email,
+        approved=approved,
+        synced_user_id=user.id if user else None,
+    )
+    return AdminWaitlistOut.model_validate(entry)
+
+
+@router.post("/waitlist/{entry_id}/approve", response_model=AdminWaitlistOut)
+def approve_waitlist_entry(
+    _admin: SuperAdminUser, db: DbDep, entry_id: int
+) -> AdminWaitlistOut:
+    """Allow a waitlist entry in. Sets approved_at and, if the person already
+    signed in (tier='pending'), promotes them to 'free' on the spot."""
+    return _set_waitlist_approval(db, entry_id, approved=True)
+
+
+@router.post("/waitlist/{entry_id}/revoke", response_model=AdminWaitlistOut)
+def revoke_waitlist_entry(
+    _admin: SuperAdminUser, db: DbDep, entry_id: int
+) -> AdminWaitlistOut:
+    """Undo an approval. Clears approved_at and, if a 'free' account was linked
+    to this entry, parks it back at 'pending'."""
+    return _set_waitlist_approval(db, entry_id, approved=False)
+
+
 # ─────────────────────────── contacts (B5.1) ───────────────────────────
 
 

@@ -44,6 +44,8 @@ class AdminWaitlistOut(ORMModel):
     id: int
     email: str
     created_at: datetime
+    # NULL = on the list, not allowed in yet. Set when a super_admin clicks Allow.
+    approved_at: datetime | None = None
 
 
 # ─────────────────────────── contacts (B5.1) ───────────────────────────

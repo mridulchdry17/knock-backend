@@ -6,7 +6,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as OrmSession
 
 from app.core.emails import normalize_email
+from app.core.time import utcnow
 from app.models import WaitlistEntry
+
+
+def get(db: OrmSession, entry_id: int) -> WaitlistEntry | None:
+    return db.get(WaitlistEntry, entry_id)
 
 
 def get_by_email(db: OrmSession, email: str) -> WaitlistEntry | None:
@@ -15,6 +20,21 @@ def get_by_email(db: OrmSession, email: str) -> WaitlistEntry | None:
 
 def exists(db: OrmSession, email: str) -> bool:
     return get_by_email(db, email) is not None
+
+
+def is_approved(db: OrmSession, email: str) -> bool:
+    """True only if the email is on the waitlist AND a super_admin allowed it."""
+    entry = get_by_email(db, email)
+    return entry is not None and entry.approved_at is not None
+
+
+def set_approved(db: OrmSession, entry: WaitlistEntry, *, approved: bool) -> WaitlistEntry:
+    """Allow (approved=True → stamp approved_at=now) or revoke (False → NULL).
+    Caller commits. Idempotent."""
+    entry.approved_at = utcnow() if approved else None
+    db.add(entry)
+    db.flush()
+    return entry
 
 
 def add(db: OrmSession, email: str) -> WaitlistEntry:

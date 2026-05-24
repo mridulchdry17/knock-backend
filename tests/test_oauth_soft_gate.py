@@ -51,13 +51,29 @@ def test_super_admin_check_is_case_insensitive(db: Session, monkeypatch) -> None
     assert decision.new_tier == "super_admin"
 
 
-def test_waitlist_match_auto_claims_to_free(db: Session, waitlist_email: str) -> None:
-    user = _make_user(db, email=waitlist_email, tier="pending")
+def test_approved_waitlist_match_auto_claims_to_free(
+    db: Session, approved_waitlist_email: str
+) -> None:
+    user = _make_user(db, email=approved_waitlist_email, tier="pending")
 
     decision = decide_tier_and_destination(db, user)
 
     assert decision.new_tier == "free"
     assert decision.next_path == "/today"
+    assert decision.claim_email == approved_waitlist_email
+
+
+def test_unapproved_waitlist_match_stays_pending_but_links(
+    db: Session, waitlist_email: str
+) -> None:
+    """On the list but not allowed in yet → still pending, but we remember the
+    match (claim_email) so the admin can find + approve them."""
+    user = _make_user(db, email=waitlist_email, tier="pending")
+
+    decision = decide_tier_and_destination(db, user)
+
+    assert decision.new_tier == "pending"
+    assert decision.next_path == "/awaiting-approval"
     assert decision.claim_email == waitlist_email
 
 
@@ -92,7 +108,7 @@ def test_returning_pending_user_still_pending(db: Session) -> None:
     decision = decide_tier_and_destination(db, user)
 
     assert decision.new_tier == "pending"
-    assert decision.next_path == "/onboarding"
+    assert decision.next_path == "/awaiting-approval"
 
 
 def test_paid_returning_user_keeps_paid(db: Session) -> None:
@@ -109,15 +125,30 @@ def test_paid_returning_user_keeps_paid(db: Session) -> None:
 # ─────────────────────────── claim_waitlist ───────────────────────────
 
 
-def test_claim_waitlist_ok(db: Session, waitlist_email: str) -> None:
+def test_claim_approved_waitlist_ok(db: Session, approved_waitlist_email: str) -> None:
+    user = _make_user(db, email="other@example.com", tier="pending")
+
+    result = onboarding_service.claim_waitlist(db, user, approved_waitlist_email)
+
+    assert result is onboarding_service.ClaimResult.OK
+    db.refresh(user)
+    assert user.waitlist_email == approved_waitlist_email
+    assert user.tier == "free"
+
+
+def test_claim_unapproved_waitlist_links_but_stays_pending(
+    db: Session, waitlist_email: str
+) -> None:
+    """Claiming an un-approved entry links the spot (so the admin can find them)
+    but does NOT grant access — they wait for approval."""
     user = _make_user(db, email="other@example.com", tier="pending")
 
     result = onboarding_service.claim_waitlist(db, user, waitlist_email)
 
-    assert result is onboarding_service.ClaimResult.OK
+    assert result is onboarding_service.ClaimResult.PENDING_APPROVAL
     db.refresh(user)
-    assert user.waitlist_email == waitlist_email
-    assert user.tier == "free"
+    assert user.waitlist_email == waitlist_email  # linked
+    assert user.tier == "pending"  # but gated
 
 
 def test_claim_waitlist_not_found(db: Session) -> None:
@@ -151,24 +182,28 @@ def test_claim_waitlist_taken_by_other_user(db: Session, waitlist_email: str) ->
     assert other.waitlist_email == waitlist_email  # unchanged
 
 
-def test_claim_waitlist_idempotent_for_same_user(db: Session, waitlist_email: str) -> None:
+def test_claim_waitlist_idempotent_for_same_user(
+    db: Session, approved_waitlist_email: str
+) -> None:
     user = _make_user(db, email="other@example.com", tier="pending")
 
-    first = onboarding_service.claim_waitlist(db, user, waitlist_email)
-    second = onboarding_service.claim_waitlist(db, user, waitlist_email)
+    first = onboarding_service.claim_waitlist(db, user, approved_waitlist_email)
+    second = onboarding_service.claim_waitlist(db, user, approved_waitlist_email)
 
     assert first is onboarding_service.ClaimResult.OK
     assert second is onboarding_service.ClaimResult.OK
 
 
-def test_claim_waitlist_normalizes_email_case(db: Session, waitlist_email: str) -> None:
+def test_claim_waitlist_normalizes_email_case(
+    db: Session, approved_waitlist_email: str
+) -> None:
     user = _make_user(db, email="other@example.com", tier="pending")
 
-    result = onboarding_service.claim_waitlist(db, user, waitlist_email.upper())
+    result = onboarding_service.claim_waitlist(db, user, approved_waitlist_email.upper())
 
     assert result is onboarding_service.ClaimResult.OK
     db.refresh(user)
-    assert user.waitlist_email == waitlist_email  # stored lowercased
+    assert user.waitlist_email == approved_waitlist_email  # stored lowercased
 
 
 # ─────────────────────────── join_waitlist ───────────────────────────

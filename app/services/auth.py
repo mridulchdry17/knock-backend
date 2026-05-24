@@ -60,11 +60,17 @@ def decide_tier_and_destination(db: OrmSession, user: User) -> TierDecision:
       2. Already onboarded (waitlist_email IS NOT NULL) and tier != pending →
          keep tier, /today.
       3. Already onboarded but tier == pending → still awaiting approval →
-         frontend routes them to /awaiting-approval based on /onboarding/status.
-      4. Not yet onboarded but OAuth email is on the waitlist → auto-claim,
-         tier='free', /today.
-      5. Not yet onboarded and no waitlist match → leave tier='pending',
+         /awaiting-approval.
+      4. Not yet onboarded, OAuth email is on the waitlist AND approved →
+         auto-claim, tier='free', /today.
+      5. Not yet onboarded, OAuth email is on the waitlist but NOT approved →
+         link the spot (claim_email) but stay 'pending' → /awaiting-approval.
+      6. Not yet onboarded and no waitlist match → leave tier='pending',
          /onboarding (frontend will offer claim-other-email or join-waitlist).
+
+    The approval gate (steps 4/5): being on the waitlist is NOT enough — a
+    super_admin must have stamped approved_at. This is what enforces "we approve
+    in waves" instead of auto-admitting every signup.
     """
     if _is_super_admin_email(user.email):
         return TierDecision(new_tier="super_admin", next_path="/today", claim_email=None)
@@ -73,12 +79,21 @@ def decide_tier_and_destination(db: OrmSession, user: User) -> TierDecision:
         # Returning user — keep whatever tier they already have. Do not
         # silently re-promote a pending user; admin must approve them.
         if user.tier == "pending":
-            return TierDecision(new_tier="pending", next_path="/onboarding", claim_email=None)
+            return TierDecision(
+                new_tier="pending", next_path="/awaiting-approval", claim_email=None
+            )
         return TierDecision(new_tier=user.tier, next_path="/today", claim_email=None)
 
-    # Not onboarded yet. Try waitlist auto-claim.
-    if waitlist_repo.exists(db, user.email):
-        return TierDecision(new_tier="free", next_path="/today", claim_email=user.email)
+    # Not onboarded yet. Match the OAuth email against the waitlist.
+    entry = waitlist_repo.get_by_email(db, user.email)
+    if entry is not None:
+        if entry.approved_at is not None:
+            # Approved → auto-claim to free.
+            return TierDecision(new_tier="free", next_path="/today", claim_email=user.email)
+        # On the list but not allowed in yet — remember the match, keep pending.
+        return TierDecision(
+            new_tier="pending", next_path="/awaiting-approval", claim_email=user.email
+        )
 
     return TierDecision(new_tier="pending", next_path="/onboarding", claim_email=None)
 
