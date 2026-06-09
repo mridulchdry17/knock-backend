@@ -27,11 +27,13 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session as OrmSession
 
+from app.config import settings
 from app.core.time import utcnow
 from app.logging_config import get_logger
 from app.models import Contact, EmailFailure, SendQueue, TodayBatchItem, User
 from app.repositories import email_failures as failures_repo
 from app.repositories import locks as locks_repo
+from app.repositories import user_contact_cooldown as cooldown_repo
 from app.services import gmail_send, send_caps
 from app.services.google_oauth import OAuthError, get_user_credentials
 
@@ -151,8 +153,21 @@ def _record_success(
         db, item.company_domain, locked_by_user_id=user.id
     )
 
+    # 30-day per-user "I already emailed this contact" cooldown — applied to
+    # the TO recipient AND every CC. The picker reads this to keep tomorrow's
+    # batch fresh (no resurfacing for the same student-recipient pair).
+    cooldown_repo.upsert_after_send(
+        db,
+        user_id=user.id,
+        contact_ids=[to_contact.id, *cc_ids],
+        now=now,
+        cooldown_days=settings.USER_CONTACT_COOLDOWN_DAYS,
+    )
+
     # Audit row in send_queue. `contact_id` is the legacy column; we set it to
-    # to_contact_id for back-compat with any old reader.
+    # to_contact_id for back-compat with any old reader. `kind` is 'INITIAL'
+    # or 'FOLLOWUP' depending on the TBI's kind — uppercased to match the
+    # send_queue.kind convention.
     sq = SendQueue(
         user_id=user.id,
         contact_id=to_contact.id,
@@ -164,7 +179,8 @@ def _record_success(
         body_text=item.body,
         gmail_message_id=result.gmail_message_id,
         gmail_thread_id=result.gmail_thread_id,
-        kind="INITIAL",
+        rfc822_message_id=result.rfc822_message_id,
+        kind="FOLLOWUP" if (item.kind == "followup") else "INITIAL",
         scheduled_for=item.send_time,
         status="SENT",
         sent_at=now,
@@ -296,15 +312,40 @@ def drain_due_items(
             )
             continue
 
-        result = gmail_send.send_email(
-            creds,
-            sender_email=user.email,
-            sender_name=user.sender_signature_name or user.full_name,
-            to_email=to_contact.email,
-            cc_emails=cc_emails,
-            subject=item.subject,
-            body_text=item.body,
-        )
+        # Follow-up cards land as REPLIES on the original Gmail thread —
+        # different code path so the In-Reply-To + References + threadId all
+        # get set. The followup planner ensures parent_send_queue_id is set
+        # on kind='followup' rows; we fetch the parent's IDs here.
+        if item.kind == "followup" and item.parent_send_queue_id is not None:
+            parent_sq = db.get(SendQueue, item.parent_send_queue_id)
+            if (
+                parent_sq is None
+                or not parent_sq.gmail_thread_id
+            ):
+                _record_skip(db, item, reason="parent_thread_missing")
+                summary.skipped += 1
+                continue
+            result = gmail_send.send_followup(
+                creds,
+                sender_email=user.email,
+                sender_name=user.sender_signature_name or user.full_name,
+                to_email=to_contact.email,
+                cc_emails=cc_emails,
+                subject=item.subject,
+                body_text=item.body,
+                gmail_thread_id=parent_sq.gmail_thread_id,
+                in_reply_to_rfc822_id=parent_sq.rfc822_message_id,
+            )
+        else:
+            result = gmail_send.send_email(
+                creds,
+                sender_email=user.email,
+                sender_name=user.sender_signature_name or user.full_name,
+                to_email=to_contact.email,
+                cc_emails=cc_emails,
+                subject=item.subject,
+                body_text=item.body,
+            )
 
         if result.ok:
             _record_success(

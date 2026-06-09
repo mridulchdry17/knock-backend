@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     GLOBAL_LOCK_DAYS: int = 2
     FOLLOWUP_DELAY_DAYS: int = 4
     MAX_FOLLOWUPS: int = 2
+    # Per-user "I already emailed this contact" cooldown. Once a user emails
+    # a contact (initial or follow-up, TO or CC), the contact is hidden from
+    # that user's daily batch for this many days. Distinct from the 36h
+    # platform-wide cohort hold (any user → blocks everyone) and the 2-day
+    # post-reply user lock.
+    USER_CONTACT_COOLDOWN_DAYS: int = 30
     SESSION_TTL_DAYS: int = 30
 
     LOG_LEVEL: str = "INFO"

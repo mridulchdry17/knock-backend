@@ -115,17 +115,23 @@ def pick_companies_for_user(
     blocked_user_lock_domains: set[str],
     blocked_platform_permanent_domains: set[str],
     cooldown_domains: set[str],
+    blocked_contact_ids: set[int] | None = None,
     batch_date: date,
     tier: Tier,
     rng: Random,
 ) -> list[CompanyPick]:
     """Pure: returns up to `cap` company picks for one user's daily batch.
 
-    Filters (any membership rejects the company):
+    Domain-level filters (any membership rejects the company):
       - `excluded_domains`: user's exclusion list
-      - `blocked_user_lock_domains`: this user's active 30-day reply locks
+      - `blocked_user_lock_domains`: this user's active reply locks (2 days)
       - `blocked_platform_permanent_domains`: explicit-stop permanent locks
       - `cooldown_domains`: active 36h platform cooldowns
+
+    Contact-level filter (drops the contact before grouping):
+      - `blocked_contact_ids`: this user's 30-day "I already emailed them"
+        cooldown — keyed on contact, not domain, so the picker can still rotate
+        OTHER contacts at the same company once the platform 36h hold expires.
 
     Within an eligible company:
       - sample up to 5 contacts (1 TO + up to 4 CC)
@@ -137,7 +143,14 @@ def pick_companies_for_user(
     if cap <= 0:
         return []
 
-    grouped = _group_by_company(candidates)
+    blocked_contact_ids = blocked_contact_ids or set()
+
+    # Drop contacts the user is in a personal cooldown for BEFORE grouping —
+    # a company keeps eligibility iff at least one un-cooled contact survives.
+    eligible_candidates = [
+        c for c in candidates if c.contact_id not in blocked_contact_ids
+    ]
+    grouped = _group_by_company(eligible_candidates)
 
     blocked = (
         excluded_domains

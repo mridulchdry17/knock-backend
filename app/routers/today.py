@@ -15,9 +15,10 @@ from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
 from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
-from app.models import Company, Contact, TodayBatchItem
+from app.models import Company, Contact, SendQueue, TodayBatchItem
 from app.repositories import today_batch as today_repo
 from app.schemas.today import (
+    ParentSendSummaryOut,
     RecipientOut,
     SendBatchResultOut,
     SkipTodayResultOut,
@@ -61,6 +62,7 @@ def _item_to_out(
     *,
     contacts_by_id: dict[int, Contact],
     company: Company | None,
+    parent_by_id: dict[int, SendQueue] | None = None,
 ) -> TodayItemOut:
     # If the company row vanished (cascade somehow lost it) fall back to the
     # denormalized domain to keep the response usable. Defensive — shouldn't
@@ -94,6 +96,24 @@ def _item_to_out(
             continue
         cc_recipients.append(_recipient_from_contact(cc_contact, company))
 
+    # Follow-up cards carry the originating send's subject/body/sent_at so the
+    # reading pane can show "Sent 4 days ago · no reply yet" with the prose
+    # collapsed below. parent_by_id is keyed on send_queue.id; absent on
+    # initial cards.
+    parent_out: ParentSendSummaryOut | None = None
+    if (
+        item.kind == "followup"
+        and item.parent_send_queue_id is not None
+        and parent_by_id is not None
+    ):
+        parent_sq = parent_by_id.get(item.parent_send_queue_id)
+        if parent_sq is not None and parent_sq.sent_at is not None:
+            parent_out = ParentSendSummaryOut(
+                original_subject=parent_sq.subject or "",
+                original_body=parent_sq.body_text or "",
+                original_sent_at=ensure_utc(parent_sq.sent_at),
+            )
+
     return TodayItemOut(
         id=str(item.id),
         recipient=to_recipient,
@@ -113,22 +133,28 @@ def _item_to_out(
         status=item.status,  # type: ignore[arg-type]
         cooldown_until=None,
         sent_at=None,
+        kind=item.kind if item.kind in ("initial", "followup") else "initial",  # type: ignore[arg-type]
+        followup_index=item.followup_index,
+        parent=parent_out,
     )
 
 
 def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
-    """Bulk-fetch contacts + companies for all items in one round-trip each.
-    Beats the N+1 we'd get from looking them up per-item.
+    """Bulk-fetch contacts + companies + (for follow-ups) parent send_queue rows
+    in one round-trip each. Beats the N+1 we'd get from looking them up per-item.
     """
     if not items:
         return []
 
     contact_ids: set[int] = set()
     company_ids: set[int] = set()
+    parent_send_queue_ids: set[int] = set()
     for item in items:
         contact_ids.add(item.to_contact_id)
         contact_ids.update(item.get_cc_contact_ids())
         company_ids.add(item.company_id)
+        if item.parent_send_queue_id is not None:
+            parent_send_queue_ids.add(item.parent_send_queue_id)
 
     from sqlalchemy import select
 
@@ -140,12 +166,21 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
         co.id: co
         for co in db.scalars(select(Company).where(Company.id.in_(company_ids))).all()
     }
+    parent_by_id: dict[int, SendQueue] = {}
+    if parent_send_queue_ids:
+        parent_by_id = {
+            sq.id: sq
+            for sq in db.scalars(
+                select(SendQueue).where(SendQueue.id.in_(parent_send_queue_ids))
+            ).all()
+        }
 
     return [
         _item_to_out(
             item,
             contacts_by_id=contacts_by_id,
             company=companies_by_id.get(item.company_id),
+            parent_by_id=parent_by_id,
         )
         for item in items
     ]
