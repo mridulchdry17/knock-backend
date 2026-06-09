@@ -291,6 +291,89 @@ def test_revoke_waitlist_entry_clears_and_downgrades_free_user(
     assert db.get(User, user.id).tier == "pending"
 
 
+def test_approve_waitlist_as_paid_promotes_linked_pending_to_paid(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """Pre-mark a waitlist entry as paid + link an already-pending user →
+    that user jumps straight to 'paid', no need for a separate Promote click."""
+    entry = waitlist_repo.add(db, "vip@example.com")
+    db.commit()
+    user = _make_user(
+        db,
+        email="vip@example.com",
+        google_sub="g-vip",
+        tier="pending",
+        waitlist_email="vip@example.com",
+    )
+
+    client = client_factory(super_admin)
+    r = client.post(
+        f"/api/v1/admin/waitlist/{entry.id}/approve", json={"tier": "paid"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approved_at"] is not None
+    assert body["intended_tier"] == "paid"
+
+    db.expire_all()
+    assert db.get(User, user.id).tier == "paid"
+
+
+def test_approve_waitlist_as_paid_bumps_already_free_user(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """If a user was already 'free' (e.g. allowed earlier with default tier)
+    and the admin re-allows the entry as paid, the linked user goes free→paid."""
+    entry = waitlist_repo.add(db, "upgrade@example.com")
+    waitlist_repo.set_approved(db, entry, approved=True)  # initially free
+    db.commit()
+    user = _make_user(
+        db,
+        email="upgrade@example.com",
+        google_sub="g-up",
+        tier="free",
+        waitlist_email="upgrade@example.com",
+    )
+
+    client = client_factory(super_admin)
+    r = client.post(
+        f"/api/v1/admin/waitlist/{entry.id}/approve", json={"tier": "paid"}
+    )
+    assert r.status_code == 200
+
+    db.expire_all()
+    assert db.get(User, user.id).tier == "paid"
+
+
+def test_approve_waitlist_empty_body_defaults_to_free(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """Back-compat: existing callers send `{}` (or no body) and get the legacy
+    Allow → free behaviour."""
+    entry = waitlist_repo.add(db, "legacy@example.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.post(f"/api/v1/admin/waitlist/{entry.id}/approve")
+    assert r.status_code == 200
+    assert r.json()["intended_tier"] == "free"
+
+
+def test_revoke_resets_intended_tier_back_to_free(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """A revoked entry shouldn't carry stale 'paid' state into a future
+    re-approval — revoke resets intended_tier to 'free'."""
+    entry = waitlist_repo.add(db, "rev@example.com")
+    waitlist_repo.set_approved(db, entry, approved=True, intended_tier="paid")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.post(f"/api/v1/admin/waitlist/{entry.id}/revoke")
+    assert r.status_code == 200
+    assert r.json()["intended_tier"] == "free"
+
+
 def test_approve_waitlist_unknown_entry_404(client_factory, super_admin: User) -> None:
     client = client_factory(super_admin)
     assert client.post("/api/v1/admin/waitlist/99999/approve").status_code == 404

@@ -15,7 +15,7 @@ import io
 from datetime import timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app.core.deps import DbDep, SuperAdminUser
@@ -34,6 +34,7 @@ from app.schemas.admin import (
     AdminPlatformLockOut,
     AdminUserOut,
     AdminWaitlistOut,
+    ApproveWaitlistIn,
     CompanySummaryOut,
     ContactUploadIn,
     ContactUploadResultOut,
@@ -180,17 +181,27 @@ def export_waitlist_csv(_admin: SuperAdminUser, db: DbDep) -> StreamingResponse:
     )
 
 
-def _set_waitlist_approval(db: DbDep, entry_id: int, *, approved: bool) -> AdminWaitlistOut:
+def _set_waitlist_approval(
+    db: DbDep,
+    entry_id: int,
+    *,
+    approved: bool,
+    intended_tier: str = "free",
+) -> AdminWaitlistOut:
     """Allow (or revoke) a waitlist entry, and keep any already-linked account
     in sync so the decision takes effect immediately — an approved tester
-    shouldn't have to sign in again to get unblocked."""
+    shouldn't have to sign in again to get unblocked. When approving, the
+    intended tier ('free' or 'paid') is recorded on the entry AND applied to
+    any matching account."""
     entry = waitlist_repo.get(db, entry_id)
     if entry is None:
         raise ApiError(
             "not_found", "Waitlist entry not found.", status_code=status.HTTP_404_NOT_FOUND
         )
 
-    waitlist_repo.set_approved(db, entry, approved=approved)
+    waitlist_repo.set_approved(
+        db, entry, approved=approved, intended_tier=intended_tier
+    )
 
     # Find the account this entry belongs to (claimed via waitlist_email, or
     # signed in with the same address) and sync its tier.
@@ -198,16 +209,24 @@ def _set_waitlist_approval(db: DbDep, entry_id: int, *, approved: bool) -> Admin
         db, entry.email
     )
     if user is not None:
-        if approved and user.tier == "pending":
-            if user.waitlist_email != entry.email:
-                users_repo.set_waitlist_email(db, user, entry.email)
-            users_repo.set_tier(db, user, "free")
-            # Lazy import — avoid pulling the templates/Gmail graph at module load.
-            from app.services import templates as templates_svc
+        if approved:
+            # Bump pending → intended; OR promote free → paid if pre-marked paid.
+            # Never downgrade paid/super_admin via this path (use the user-level
+            # tier endpoint for that).
+            should_bump = user.tier == "pending" or (
+                user.tier == "free" and intended_tier == "paid"
+            )
+            if should_bump:
+                if user.waitlist_email != entry.email:
+                    users_repo.set_waitlist_email(db, user, entry.email)
+                users_repo.set_tier(db, user, intended_tier)
+                # Lazy import — avoid pulling the templates/Gmail graph at module load.
+                from app.services import templates as templates_svc
 
-            templates_svc.seed_starters(db, user)
-        elif not approved and user.tier == "free":
-            # Pull access back. Don't touch paid/super_admin tiers.
+                # Idempotent: only seeds if the user has 0 templates.
+                templates_svc.seed_starters(db, user)
+        elif not approved and user.tier in ("free", "paid"):
+            # Pull access back. Don't touch super_admin tier.
             users_repo.set_tier(db, user, "pending")
 
     db.commit()
@@ -216,6 +235,7 @@ def _set_waitlist_approval(db: DbDep, entry_id: int, *, approved: bool) -> Admin
         entry_id=entry.id,
         email=entry.email,
         approved=approved,
+        intended_tier=intended_tier,
         synced_user_id=user.id if user else None,
     )
     return AdminWaitlistOut.model_validate(entry)
@@ -223,19 +243,25 @@ def _set_waitlist_approval(db: DbDep, entry_id: int, *, approved: bool) -> Admin
 
 @router.post("/waitlist/{entry_id}/approve", response_model=AdminWaitlistOut)
 def approve_waitlist_entry(
-    _admin: SuperAdminUser, db: DbDep, entry_id: int
+    _admin: SuperAdminUser,
+    db: DbDep,
+    entry_id: int,
+    payload: ApproveWaitlistIn | None = Body(default=None),
 ) -> AdminWaitlistOut:
-    """Allow a waitlist entry in. Sets approved_at and, if the person already
-    signed in (tier='pending'), promotes them to 'free' on the spot."""
-    return _set_waitlist_approval(db, entry_id, approved=True)
+    """Allow a waitlist entry in. Empty body / `{tier:'free'}` = the legacy
+    default (Allow → free); `{tier:'paid'}` pre-marks the entry so the user
+    lands at 'paid' on sign-in (or gets bumped to paid now if already linked)."""
+    tier = payload.tier if payload is not None else "free"
+    return _set_waitlist_approval(db, entry_id, approved=True, intended_tier=tier)
 
 
 @router.post("/waitlist/{entry_id}/revoke", response_model=AdminWaitlistOut)
 def revoke_waitlist_entry(
     _admin: SuperAdminUser, db: DbDep, entry_id: int
 ) -> AdminWaitlistOut:
-    """Undo an approval. Clears approved_at and, if a 'free' account was linked
-    to this entry, parks it back at 'pending'."""
+    """Undo an approval. Clears approved_at, resets intended_tier to 'free',
+    and if a 'free'/'paid' account was linked to this entry, parks it back at
+    'pending'. super_admin tier untouched."""
     return _set_waitlist_approval(db, entry_id, approved=False)
 
 

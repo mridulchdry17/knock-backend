@@ -28,10 +28,23 @@ def is_approved(db: OrmSession, email: str) -> bool:
     return entry is not None and entry.approved_at is not None
 
 
-def set_approved(db: OrmSession, entry: WaitlistEntry, *, approved: bool) -> WaitlistEntry:
-    """Allow (approved=True → stamp approved_at=now) or revoke (False → NULL).
-    Caller commits. Idempotent."""
-    entry.approved_at = utcnow() if approved else None
+def set_approved(
+    db: OrmSession,
+    entry: WaitlistEntry,
+    *,
+    approved: bool,
+    intended_tier: str = "free",
+) -> WaitlistEntry:
+    """Allow (approved=True → stamp approved_at=now + record intended tier) or
+    revoke (False → NULL). On revoke we reset intended_tier to 'free' so a
+    later re-approve doesn't accidentally honour stale 'paid' state. Caller
+    commits. Idempotent."""
+    if approved:
+        entry.approved_at = utcnow()
+        entry.intended_tier = intended_tier
+    else:
+        entry.approved_at = None
+        entry.intended_tier = "free"
     db.add(entry)
     db.flush()
     return entry

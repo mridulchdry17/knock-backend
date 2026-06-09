@@ -46,6 +46,16 @@ class AdminWaitlistOut(ORMModel):
     created_at: datetime
     # NULL = on the list, not allowed in yet. Set when a super_admin clicks Allow.
     approved_at: datetime | None = None
+    # What tier this entry will grant on sign-in. 'free' is the default; admin
+    # can pre-mark 'paid' so the user lands paid without a second click.
+    intended_tier: Literal["free", "paid"] = "free"
+
+
+class ApproveWaitlistIn(BaseModel):
+    """Optional body for POST /admin/waitlist/{id}/approve. Empty body keeps
+    the legacy default (free)."""
+
+    tier: Literal["free", "paid"] = "free"
 
 
 # ─────────────────────────── contacts (B5.1) ───────────────────────────
