@@ -104,13 +104,26 @@ def waitlist_email(db: Session) -> str:
 
 @pytest.fixture
 def approved_waitlist_email(db: Session) -> str:
-    """Seeds an APPROVED waitlist entry; returns the email. This is the only
-    state that auto-grants tier='free'."""
+    """Seeds an APPROVED waitlist entry (intended_tier='free'); returns the
+    email. This is the default Allow path — auto-grants tier='free'."""
     from app.repositories import waitlist as waitlist_repo
 
     email = "approved@startup.com"
     entry = waitlist_repo.add(db, email)
     waitlist_repo.set_approved(db, entry, approved=True)
+    db.commit()
+    return email
+
+
+@pytest.fixture
+def approved_paid_waitlist_email(db: Session) -> str:
+    """Seeds an APPROVED waitlist entry pre-marked intended_tier='paid';
+    returns the email. Auto-grants tier='paid' on sign-in / claim."""
+    from app.repositories import waitlist as waitlist_repo
+
+    email = "vip@startup.com"
+    entry = waitlist_repo.add(db, email)
+    waitlist_repo.set_approved(db, entry, approved=True, intended_tier="paid")
     db.commit()
     return email
 

@@ -63,6 +63,20 @@ def test_approved_waitlist_match_auto_claims_to_free(
     assert decision.claim_email == approved_waitlist_email
 
 
+def test_paid_waitlist_match_auto_claims_to_paid(
+    db: Session, approved_paid_waitlist_email: str
+) -> None:
+    """When the admin pre-marks a waitlist entry as paid, auth lands the user
+    at 'paid' on first sign-in — not 'free' + a follow-up Promote click."""
+    user = _make_user(db, email=approved_paid_waitlist_email, tier="pending")
+
+    decision = decide_tier_and_destination(db, user)
+
+    assert decision.new_tier == "paid"
+    assert decision.next_path == "/today"
+    assert decision.claim_email == approved_paid_waitlist_email
+
+
 def test_unapproved_waitlist_match_stays_pending_but_links(
     db: Session, waitlist_email: str
 ) -> None:
@@ -134,6 +148,20 @@ def test_claim_approved_waitlist_ok(db: Session, approved_waitlist_email: str) -
     db.refresh(user)
     assert user.waitlist_email == approved_waitlist_email
     assert user.tier == "free"
+
+
+def test_claim_paid_waitlist_lands_at_paid(
+    db: Session, approved_paid_waitlist_email: str
+) -> None:
+    """Cross-email claim on a paid-pre-marked entry → user becomes paid."""
+    user = _make_user(db, email="other@example.com", tier="pending")
+
+    result = onboarding_service.claim_waitlist(db, user, approved_paid_waitlist_email)
+
+    assert result is onboarding_service.ClaimResult.OK
+    db.refresh(user)
+    assert user.waitlist_email == approved_paid_waitlist_email
+    assert user.tier == "paid"
 
 
 def test_claim_unapproved_waitlist_links_but_stays_pending(

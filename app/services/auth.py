@@ -88,8 +88,13 @@ def decide_tier_and_destination(db: OrmSession, user: User) -> TierDecision:
     entry = waitlist_repo.get_by_email(db, user.email)
     if entry is not None:
         if entry.approved_at is not None:
-            # Approved → auto-claim to free.
-            return TierDecision(new_tier="free", next_path="/today", claim_email=user.email)
+            # Approved → auto-claim to whatever tier the admin pre-marked
+            # (free by default; paid if the admin clicked Allow as paid).
+            return TierDecision(
+                new_tier=entry.intended_tier,
+                next_path="/today",
+                claim_email=user.email,
+            )
         # On the list but not allowed in yet — remember the match, keep pending.
         return TierDecision(
             new_tier="pending", next_path="/awaiting-approval", claim_email=user.email

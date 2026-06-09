@@ -55,7 +55,8 @@ def claim_waitlist(db: OrmSession, user: User, claimed_email: str) -> ClaimResul
     users_repo.set_waitlist_email(db, user, target)
 
     if entry.approved_at is not None:
-        users_repo.set_tier(db, user, "free")
+        # Honour the admin's pre-mark — 'free' by default, 'paid' if pre-marked.
+        users_repo.set_tier(db, user, entry.intended_tier)
         _seed_starters_safely(db, user)
         db.commit()
         return ClaimResult.OK
