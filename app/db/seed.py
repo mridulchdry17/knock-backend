@@ -6,13 +6,13 @@ login (see auth flow). System-wide reference data lands here when needed.
 from __future__ import annotations
 
 from app.db.base import SessionLocal
-from app.logging import configure_logging, get_logger
+from app.logging_config import configure_logging, get_logger
 
 
 def main() -> None:
     configure_logging()
     log = get_logger("seed")
-    with SessionLocal() as db:
+    with SessionLocal():
         # No global seed data yet. Migrations create tables; user-scoped
         # starter templates are inserted in the auth callback (services/auth.py).
         log.info("seed.complete", inserted=0)

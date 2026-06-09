@@ -19,6 +19,10 @@ db/*.db
 db/*.db-journal
 db/*.db-wal
 db/*.db-shm
+# Turso embedded-replica local file + its sync-state sidecars
+db/*.db-info
+db/*.db-client_wal_index
+db/replica.db*
 *.sqlite*
 
 # Editors / OS

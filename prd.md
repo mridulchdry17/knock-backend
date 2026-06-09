@@ -12,76 +12,90 @@
 
 ## 0. Implementation Status (live tracker)
 
-**Last updated:** 2026-05-03 — after Phase 1 (Google OAuth + sessions) merged to feature branch.
+**Last updated:** 2026-05-23 — Phase 5 send engine (B5.1–B5.7) + frontend F1–F9 complete; all merged to `pre-release` on both repos. Read-path perf pass landed (connection pooling + batched lock checks).
 **Frontend repo contract:** see [FRONTEND.md](FRONTEND.md).
 
+> Phasing note: the build diverged from the original Phase 0–9 outline below.
+> Actual delivery ran as **Phase 4** (auth extensions + onboarding/soft-gate +
+> admin tier mgmt) and **Phase 5** (the send engine, sub-waved B5.1→B5.7). The
+> table is re-mapped to what shipped; original phase names kept in parentheses
+> for traceability.
+
 ### Legend
-- ✅ **Done** — implemented, live-tested, on a feature branch.
+- ✅ **Done** — implemented, on `pre-release`.
 - 🟡 **Partial** — module exists, some sub-features still missing.
 - ⬜ **Not started** — scoped, not yet built.
 - 🚫 **Out of MVP** — deferred to post-MVP.
 
 ### Phase tracker
 
-| Phase | Scope | Status | Branch |
+| Phase | Scope | Status | Branch (merged to `pre-release`) |
 |---|---|---|---|
 | Phase 0 | Project foundation, schema, Alembic, health API | ✅ Done | `feat/foundation-and-schema` |
 | Phase 1 | Google OAuth + sessions + auth API | ✅ Done | `feat/google-oauth-and-sessions` |
-| Phase 2 | Onboarding + Gmail send (test endpoint) | ⬜ Next | — |
-| Phase 3 | Templates CRUD + render preview | ⬜ | — |
-| Phase 4 | Scrapers + companies + contact discovery | ⬜ | — |
-| Phase 5 | Campaigns + send queue + send worker | ⬜ | — |
-| Phase 6 | Reply + bounce detection (Gmail polling) | ⬜ | — |
-| Phase 7 | Follow-up engine | ⬜ | — |
-| Phase 8 | Admin endpoints + dashboard summary | ⬜ | — |
-| Phase 9 | Tests (moat invariant, pipeline, scope check) | 🟡 (none yet) | — |
+| Phase 2/3 | Onboarding, soft-gate approval, waitlist claim | ✅ Done | (Phase 4 wave) |
+| Phase 4 | Tier system + admin (user mgmt, tier set, suspend) | ✅ Done | (Phase 4 wave) |
+| B5.1 | Admin contact-pool CSV upload + companies | ✅ Done | `feat/b5-1-contacts-upload` |
+| B5.2 | User preferences + exclusion list | ✅ Done | `feat/b5-2-user-preferences` |
+| B5.3 | 3-tier lock model + read-only contact browser | ✅ Done | `feat/b5-3-contacts-pool-and-locks` |
+| B5.4 | Today batch picker + `/today` + admin cron trigger | ✅ Done | `feat/b5-4-today-batch-cron` |
+| B5.5 | Gmail send worker + `email_failures` dashboard | ✅ Done | `feat/b5-5-send-worker` |
+| B5.6 | Reply ingestion + explicit-stop + `/inbox` | ✅ Done | `feat/b5-6-reply-ingestion` |
+| B5.7 | Autopilot daily-cycle cron + admin trigger | ✅ Done | `feat/b5-7-autopilot-worker` |
+| Frontend | F1–F9 (shell, auth, gmail, admin, today, templates, inbox, prefs, polish) | ✅ Done | `outreach-frontend` PRs #1–#10 |
+| Perf v0 | QueuePool + `pool_recycle`; batched lock checks (~10× reads) | ✅ Done | (cherry-picked to `pre-release`) |
+| Scheduler | APScheduler drives autopilot cycle on interval (`RUN_SCHEDULER` flag) | ✅ Done | on `pre-release` |
+| Tests | Backend suite | 🟡 259 passing | unit/router/service coverage; no full e2e against live Gmail yet |
+| Launch | v0 deploy ceremony (VM, prod `.env`, NSG close, Vercel flip) | ⬜ Next | see [memory: project_v0_deploy_bundle] |
+
+### Known gaps (carried into v1 planning)
+- ✅ **Scheduler wired (2026-05-23).** `app/jobs/scheduler.py` runs an in-process APScheduler firing `autopilot_cycle_cron.run_cycle` every `AUTOPILOT_CYCLE_INTERVAL_MINUTES` (default 30). Gated behind `RUN_SCHEDULER` (default off; **set `RUN_SCHEDULER=1` in prod `.env`** to enable). Single-process assumption — see the module docstring before scaling to multiple workers. Admin manual-trigger endpoints retained for the launch ceremony.
+- **No real templates table.** v0 renders a hardcoded student-persona default body; `template_id` is nullable end-to-end. Real templates are deferred.
+- **Remote-DB read latency.** Turso lives in `aws-ap-south-1`; even with pooling+batching, reads pay network round-trips. **Turso embedded replica** (local SQLite synced from remote) is the v1 perf play for microsecond reads.
+- **No live-Gmail e2e test.** Send/receive verified in unit/mocked tests; a real OAuth-scope send→reply→inbox dry run is still pending.
+- **DEFERRED (accepted risk, 2026-05-23) — no unsubscribe footer / `List-Unsubscribe` header.** Conscious call: Knock sends low-volume (≤20/day), personalized 1-to-1 mail from each user's *own* Gmail, and the reply-"stop" → permanent-lock flow (B5.6) already provides the opt-out. A visible footer would make the mail read like a bulk campaign and hurt reply rates. Revisit if/when volume rises or a bulk-marketing surface is added. Cheap v1 add: the invisible `List-Unsubscribe: <mailto:…?subject=unsubscribe>` header (no body change), which dovetails with the existing stop detection.
+- **DEFERRED (accepted risk, 2026-05-23) — no API rate limiting.** Conscious call: v0 is OAuth + soft-gate-approval gated (~100-user Google testing cap), so the abuse surface is tiny and Caddy can rate-limit at the edge later. Residual: public `POST /waitlist` returns 409-on-duplicate → email presence-oracle. Cheapest v1 mitigation (no limiter needed): return 200 for both new and duplicate to kill the oracle.
 
 ### Per-section status (mapped to PRD numbering)
 
 | § | Section | Status | Notes |
 |---|---|---|---|
-| 1 | Product overview | ✅ design | — |
-| 2 | Goals & non-goals | ✅ design | — |
-| 3 | Personas & flows | ✅ design | — |
-| 4 | Architecture | ✅ design | Diagram + principles match implementation |
-| 5 | Tech stack | ✅ done | All listed deps installed |
-| 6.1 | Google OAuth + Gmail API | 🟡 partial | OAuth ✅; Gmail send/read ⬜ (Phase 2/6) |
-| 6.2 | RSS feeds | ⬜ | Phase 4 |
-| 6.3 | Hunter.io stub | ⬜ | Phase 4 |
-| 7 | DB schema | ✅ done | All 10 tables created via `0001_init` migration |
-| 8 | Google OAuth integration spec | ✅ done | `services/google_oauth.py` + token encryption |
-| 9 | Send pipeline | ⬜ | Phase 5 |
-| 10 | Reply / bounce / unsubscribe detection | ⬜ | Phase 6 |
-| 11 | Follow-up engine | ⬜ | Phase 7 |
-| 12 | Company ingestion (scrapers) | ⬜ | Phase 4 |
-| 13 | Contact / email discovery | ⬜ | Phase 4 |
-| 14 | API spec | 🟡 partial | Auth + health live; rest stubbed in spec |
-| 15 | Frontend contract | ✅ done | See FRONTEND.md |
-| 16 | Auth & sessions | ✅ done | Cookie + server-side sessions + CSRF guard live |
-| 17 | Background jobs | ⬜ | Phase 5 (scheduler bootstrap) |
-| 18 | Configuration | ✅ done | Pydantic-settings; `.env.example` ships |
-| 19 | Project structure | ✅ done | Matches spec + `repositories/` added |
-| 20 | Setup instructions | ✅ done | Dev path verified end-to-end |
-| 21 | Testing strategy | 🟡 strategy doc only | Phase 9 |
-| 22 | Compliance | 🟡 partial | Footer template doc'd; render path is Phase 5 |
-| 23 | Roadmap | ✅ design | — |
-| 24 | Risks | ✅ design | — |
-| 25 | Cost model | ✅ design | — |
-| 26 | Future scope | ✅ design | — |
+| 1–5 | Overview / goals / personas / arch / stack | ✅ | Persona reframed to students/job-seekers |
+| 6.1 | Google OAuth + Gmail API | ✅ done | OAuth + PKCE ✅; Gmail send (B5.5) + read/history (B5.6) ✅ |
+| 6.2 | RSS feeds | 🚫 | Scraper deferred; pool is admin CSV-curated for v0 |
+| 6.3 | Hunter.io stub | 🚫 | Deferred with scraper |
+| 7 | DB schema | ✅ done | Migrations through `0012`; lock tables + today_batch_items + email_failures live |
+| 8 | Google OAuth integration spec | ✅ done | token encryption + refresh in `services/google_oauth.py` |
+| 9 | Send pipeline | ✅ done | B5.4 picker → B5.5 Gmail send → 3-tier lock writes |
+| 10 | Reply / unsubscribe detection | ✅ done | B5.6 history-API ingest + explicit-stop regex |
+| 11 | Follow-up engine | 🚫 | Out of v0 |
+| 12 | Company ingestion (scrapers) | 🚫 | Admin CSV upload instead (B5.1) |
+| 13 | Contact / email discovery | 🟡 | Admin-curated; scraper-fed discovery is future |
+| 14 | API spec | ✅ done | See live-endpoints table below |
+| 15 | Frontend contract | ✅ done | See FRONTEND.md; F1–F9 shipped |
+| 16 | Auth & sessions | ✅ done | bearer-token sessions + tier gating |
+| 17 | Background jobs | ✅ | APScheduler wired (`RUN_SCHEDULER` flag); fires autopilot cycle on interval |
+| 18–20 | Config / structure / setup | ✅ done | — |
+| 21 | Testing strategy | 🟡 | 259 unit/router/service tests; no live-Gmail e2e |
+| 22 | Compliance | ✅ | Explicit-stop → permanent platform lock; 3-tier cooldowns |
+| 23–26 | Roadmap / risks / cost / future | ✅ design | — |
 
 ### Endpoints currently live
 
-| Method | Path | Status |
+| Method | Path | Notes |
 |---|---|---|
-| GET | `/healthz` | ✅ |
-| GET | `/readyz` | ✅ |
-| GET | `/auth/login` | ✅ |
-| GET | `/auth/google/callback` | ✅ |
-| GET | `/api/v1/auth/me` | ✅ |
-| POST | `/api/v1/auth/logout` | ✅ |
-| POST | `/api/v1/auth/disconnect` | ✅ |
-
-Everything else in §14 is **planned** — see the per-phase tracker above.
+| GET | `/healthz`, `/readyz` | health |
+| GET | `/auth/login`, `/auth/google/callback` | OAuth + PKCE |
+| GET/POST | `/api/v1/auth/me`, `/auth/logout`, `/auth/disconnect` | session |
+| POST | `/api/v1/waitlist` | public waitlist signup |
+| POST | `/api/v1/onboarding/claim-waitlist`, `/onboarding/join-waitlist` | soft-gate |
+| GET/PATCH | `/api/v1/preferences`, `/preferences/excluded-domains` (+ DELETE) | user prefs |
+| GET/POST | `/api/v1/autopilot`, `/autopilot/enable`, `/pause`, `/resume` | paid only |
+| GET | `/api/v1/contacts`, `/contacts/{id}` | browse pool + detail |
+| GET/PUT/DELETE | `/api/v1/contacts/{id}/my-notes` | per-user notes |
+| GET/PATCH | `/api/v1/today`, `/today/items/{id}` | daily batch (lazy-generates) |
+| GET | `/api/v1/inbox`, `/inbox/sync-status` | replies + lock state |
+| — | `/api/v1/admin/*` | users, tier, suspend, locks, contacts CSV upload, today/run-cron, send/drain, failures, failures/summary, replies/ingest, autopilot/cycle, companies/summary, waitlist export |
 
 ---
 

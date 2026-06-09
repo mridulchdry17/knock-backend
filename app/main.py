@@ -6,9 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.core.csrf import CSRFHeaderMiddleware
 from app.core.errors import register_error_handlers
-from app.logging import configure_logging, get_logger
+from app.logging_config import configure_logging, get_logger
 from app.routers import register as register_routers
 
 
@@ -17,8 +16,15 @@ async def lifespan(app: FastAPI):
     configure_logging()
     log = get_logger("startup")
     log.info("api.start", env=settings.APP_ENV, db=settings.DATABASE_URL)
-    yield
-    log.info("api.stop")
+    # Autopilot scheduler — no-op unless RUN_SCHEDULER is set (off in dev/test).
+    from app.jobs.scheduler import shutdown_scheduler, start_scheduler
+
+    start_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
+        log.info("api.stop")
 
 
 def create_app() -> FastAPI:
@@ -34,11 +40,10 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins_list,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+        allow_headers=["Authorization", "Content-Type"],
     )
-    app.add_middleware(CSRFHeaderMiddleware)
 
     register_error_handlers(app)
     register_routers(app)

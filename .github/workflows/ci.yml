@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, pre-release]
+  pull_request:
+    branches: [main, pre-release]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APP_ENV: test
+      DATABASE_URL: "sqlite:///./ci.db"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Generate ephemeral Fernet key for this run
+        # Random per-run key. Never committed; only lives in $GITHUB_ENV for
+        # subsequent steps in this workflow run.
+        run: |
+          echo "TOKEN_ENCRYPTION_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" >> "$GITHUB_ENV"
+
+      - name: Lint (ruff)
+        run: ruff check app
+
+      - name: Import smoke test
+        run: python -c "from app.main import app; print('OK', len(app.routes), 'routes')"
+
+      - name: Alembic upgrade head (ephemeral SQLite)
+        run: alembic upgrade head
+
+      - name: Tests (skipped if none)
+        run: |
+          if compgen -G "tests/test_*.py" > /dev/null; then
+            pytest -q
+          else
+            echo "No tests yet — skipping pytest."
+          fi

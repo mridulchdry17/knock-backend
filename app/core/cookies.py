@@ -1,45 +1,31 @@
-"""Cookie helpers — single source of truth for session/oauth-state cookie attrs."""
+"""Cookie helpers — only the OAuth round-trip cookies remain.
+
+Session transport is now `Authorization: Bearer <token>` (see core/deps.py).
+The oauth_state cookie binds the OAuth round-trip (login → Google → callback)
+and the oauth_code_verifier cookie carries the PKCE verifier across the same
+two endpoints. Both endpoints live on the backend domain, so cross-domain
+cookie sharing is not a concern here.
+"""
 from __future__ import annotations
 
 from fastapi import Response
 
 from app.config import settings
-from app.core.deps import SESSION_COOKIE
 
 OAUTH_STATE_COOKIE = "oauth_state"
-_OAUTH_STATE_TTL_SECONDS = 600  # 10 minutes; user has to finish the round-trip in time
+OAUTH_CODE_VERIFIER_COOKIE = "oauth_code_verifier"
+_OAUTH_TTL_SECONDS = 600  # 10 minutes; user has to finish the round-trip in time
 
 
 def _domain() -> str | None:
     return settings.COOKIE_DOMAIN or None
 
 
-def set_session_cookie(resp: Response, token: str, *, max_age_seconds: int) -> None:
+def _set_round_trip_cookie(resp: Response, key: str, value: str) -> None:
     resp.set_cookie(
-        key=SESSION_COOKIE,
-        value=token,
-        max_age=max_age_seconds,
-        httponly=True,
-        secure=settings.COOKIE_SECURE,
-        samesite=settings.COOKIE_SAMESITE,
-        domain=_domain(),
-        path="/",
-    )
-
-
-def clear_session_cookie(resp: Response) -> None:
-    resp.delete_cookie(
-        key=SESSION_COOKIE,
-        domain=_domain(),
-        path="/",
-    )
-
-
-def set_oauth_state_cookie(resp: Response, state: str) -> None:
-    resp.set_cookie(
-        key=OAUTH_STATE_COOKIE,
-        value=state,
-        max_age=_OAUTH_STATE_TTL_SECONDS,
+        key=key,
+        value=value,
+        max_age=_OAUTH_TTL_SECONDS,
         httponly=True,
         secure=settings.COOKIE_SECURE,
         samesite="lax",  # always Lax — top-level redirect from Google
@@ -48,5 +34,17 @@ def set_oauth_state_cookie(resp: Response, state: str) -> None:
     )
 
 
+def set_oauth_state_cookie(resp: Response, state: str) -> None:
+    _set_round_trip_cookie(resp, OAUTH_STATE_COOKIE, state)
+
+
 def clear_oauth_state_cookie(resp: Response) -> None:
     resp.delete_cookie(key=OAUTH_STATE_COOKIE, domain=_domain(), path="/")
+
+
+def set_oauth_code_verifier_cookie(resp: Response, code_verifier: str) -> None:
+    _set_round_trip_cookie(resp, OAUTH_CODE_VERIFIER_COOKIE, code_verifier)
+
+
+def clear_oauth_code_verifier_cookie(resp: Response) -> None:
+    resp.delete_cookie(key=OAUTH_CODE_VERIFIER_COOKIE, domain=_domain(), path="/")

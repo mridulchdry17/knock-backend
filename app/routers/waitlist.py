@@ -4,7 +4,7 @@ from fastapi import APIRouter, status
 
 from app.core.deps import DbDep
 from app.core.errors import ApiError
-from app.logging import get_logger
+from app.logging_config import get_logger
 from app.repositories import waitlist as waitlist_repo
 from app.schemas.waitlist import WaitlistJoinIn, WaitlistJoinOut
 

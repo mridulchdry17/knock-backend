@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +19,15 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite:///./db/outreach.db"
     DB_ECHO: bool = False
+
+    # Turso embedded replica (perf). When set to a writable file path AND
+    # DATABASE_URL is a libsql:// URL, the app keeps a LOCAL SQLite replica at
+    # this path: reads come from local disk (microseconds), writes forward to
+    # the remote Turso primary, and the replica pulls changes every
+    # LIBSQL_SYNC_INTERVAL seconds. Empty = disabled (talk to remote directly,
+    # current behavior). Off by default — enable on the single-process VM only.
+    LIBSQL_REPLICA_PATH: str = ""
+    LIBSQL_SYNC_INTERVAL: int = 30
 
     FRONTEND_ORIGIN: str = "http://localhost:3000"
     ALLOWED_ORIGINS: str = "http://localhost:3000"
@@ -46,16 +55,29 @@ class Settings(BaseSettings):
     SESSION_TTL_DAYS: int = 30
 
     LOG_LEVEL: str = "INFO"
+    # Master switch for the in-process autopilot scheduler (APScheduler). OFF by
+    # default so dev / test / CI never auto-send. Turn ON only in the prod
+    # deployment (single process — see app/jobs/scheduler.py for the
+    # single-worker assumption).
     RUN_SCHEDULER: bool = False
-    ADMIN_EMAILS: str = ""
+    # How often the autopilot cycle (batch-gen → send-drain → reply-ingest)
+    # fires. The cycle is idempotent, so batch generation effectively runs once
+    # per UTC day while the drain delivers each staggered send slot as it comes
+    # due and ingest pulls replies. 30 min gives finer granularity than the
+    # paid ~44-min send spacing without hammering the Gmail API.
+    AUTOPILOT_CYCLE_INTERVAL_MINUTES: int = 30
+
+    # Comma-separated emails auto-promoted to tier='super_admin' on every login.
+    # Renamed from ADMIN_EMAILS in Phase 4 to disambiguate from feature tiers.
+    SUPER_ADMIN_EMAILS: str = ""
 
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
     @property
-    def admin_emails_set(self) -> set[str]:
-        return {e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()}
+    def super_admin_emails_set(self) -> set[str]:
+        return {e.strip().lower() for e in self.SUPER_ADMIN_EMAILS.split(",") if e.strip()}
 
     @property
     def is_prod(self) -> bool:

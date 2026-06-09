@@ -1,6 +1,8 @@
 """Google OAuth 2.0 flow — strictly the auth handshake.
 
-Gmail API send/read lives in services/gmail.py (added in a later phase).
+Gmail send adapter lives in services/gmail_send.py (B5.5). This module also
+owns the credentials lookup (`get_user_credentials`) used by the send worker —
+it's the cleanest home since we already encrypt/decrypt tokens here.
 """
 from __future__ import annotations
 
@@ -10,9 +12,12 @@ from datetime import UTC, datetime
 
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
 from app.config import settings
+from app.core.crypto import decrypt_optional
+from app.models import User
 
 SCOPES: list[str] = [
     "openid",
@@ -70,22 +75,32 @@ def _build_flow(redirect_uri: str, state: str | None = None) -> Flow:
     return flow
 
 
-def build_authorization_url(redirect_uri: str) -> tuple[str, str]:
-    """Return (authorization_url, state). State must be persisted (cookie) and
-    re-verified on callback."""
+def build_authorization_url(redirect_uri: str) -> tuple[str, str, str]:
+    """Return (authorization_url, state, code_verifier).
+
+    State + code_verifier must both be persisted (cookies) and re-supplied on
+    callback. Google's OAuth server now requires PKCE on the token-exchange
+    leg even for confidential web clients — without `code_verifier` the
+    exchange fails with `invalid_grant: Missing code verifier`.
+    """
     flow = _build_flow(redirect_uri)
+    flow.autogenerate_code_verifier = True
     auth_url, state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
     )
-    return auth_url, state
+    return auth_url, state, flow.code_verifier
 
 
-def exchange_code(code: str, state: str, redirect_uri: str) -> GoogleIdentity:
+def exchange_code(
+    code: str, state: str, redirect_uri: str, code_verifier: str | None = None
+) -> GoogleIdentity:
     """Exchange the OAuth code for tokens and identity. Validates required scopes
     and verifies the id_token. Returns a frozen GoogleIdentity."""
     flow = _build_flow(redirect_uri, state=state)
+    if code_verifier:
+        flow.code_verifier = code_verifier
     flow.fetch_token(code=code)
 
     creds = flow.credentials
@@ -131,17 +146,43 @@ def exchange_code(code: str, state: str, redirect_uri: str) -> GoogleIdentity:
     )
 
 
+def get_user_credentials(user: User) -> Credentials:
+    """Build a google.oauth2 Credentials object from the user's stored tokens.
+
+    Decrypts refresh + access tokens via Fernet and constructs a Credentials
+    object the Gmail API client can use directly. google-auth handles refresh
+    automatically when an access_token is expired — but we don't persist the
+    refreshed token back here in v0 (B5.5 doesn't need that — Credentials.refresh()
+    mutates the in-memory object and Gmail calls just work). When B5.6 ships
+    long-lived workers, lift the post-refresh persist into a service helper.
+    """
+    refresh_token = decrypt_optional(user.google_refresh_token)
+    if not refresh_token:
+        raise OAuthError("missing_refresh_token")
+
+    access_token = decrypt_optional(user.google_access_token)
+
+    return Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.GOOGLE_CLIENT_ID,
+        client_secret=settings.GOOGLE_CLIENT_SECRET,
+        scopes=list(SCOPES),
+    )
+
+
 def revoke_refresh_token(refresh_token: str) -> None:
     """Best-effort revoke at Google's revoke endpoint. Failures are swallowed —
     we always clear our local copy regardless."""
+    import contextlib
+
     import httpx
 
-    try:
+    with contextlib.suppress(httpx.HTTPError):
         httpx.post(
             "https://oauth2.googleapis.com/revoke",
             data={"token": refresh_token},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=5.0,
         )
-    except httpx.HTTPError:
-        pass
