@@ -14,6 +14,18 @@ from pydantic import BaseModel
 StatusLiteral = Literal[
     "default", "ready", "skipped", "sent", "cooldown", "held"
 ]
+KindLiteral = Literal["initial", "followup"]
+
+
+class ParentSendSummaryOut(BaseModel):
+    """Context attached to a follow-up card: the originating email's subject,
+    body and sent_at so the reading pane can show 'Sent 4 days ago · No reply
+    yet' with the previous prose collapsed below.
+    """
+
+    original_subject: str
+    original_body: str
+    original_sent_at: datetime
 
 
 class RecipientOut(BaseModel):
@@ -44,6 +56,10 @@ class TodayItemOut(BaseModel):
     status: StatusLiteral
     cooldown_until: datetime | None
     sent_at: datetime | None
+    # Follow-up support — defaults so initial-only frontend versions stay valid.
+    kind: KindLiteral = "initial"
+    followup_index: int | None = None
+    parent: ParentSendSummaryOut | None = None
 
 
 class TodayBatchOut(BaseModel):

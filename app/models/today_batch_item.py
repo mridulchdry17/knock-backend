@@ -50,6 +50,25 @@ class TodayBatchItem(Base, TimestampMixin):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     send_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="default")
+    # Reason this card was set status='skipped' — e.g. "user_suspended",
+    # "gmail_disconnected", "contact_missing_email", "reply_received". Used by
+    # the admin dashboard + the followup planner to avoid spinning on items
+    # that were explicitly skipped.
+    skip_reason: Mapped[str | None] = mapped_column(String(64))
+
+    # ─────────────────────────── follow-up support ───────────────────────────
+    # 'initial' (default) = a fresh first-touch email; 'followup' = a follow-up
+    # planned by the followup engine, sent on the SAME Gmail thread as the
+    # original (subject "Re:…", In-Reply-To header set).
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="initial")
+    # Set on follow-ups only: points back to the SendQueue row of the
+    # originating email so we have its threadId / RFC822 Message-ID / body for
+    # context display + threading.
+    parent_send_queue_id: Mapped[int | None] = mapped_column(
+        ForeignKey("send_queue.id", ondelete="SET NULL")
+    )
+    # 1 = first follow-up, 2 = second. Caps at MAX_FOLLOWUPS (config).
+    followup_index: Mapped[int | None] = mapped_column(Integer)
 
     __table_args__ = (
         UniqueConstraint(

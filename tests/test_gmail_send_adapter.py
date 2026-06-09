@@ -27,7 +27,7 @@ def _decode_to_message(msg):
 
 
 def test_build_mime_basic_headers() -> None:
-    msg = gmail_send.build_mime(
+    msg, _ = gmail_send.build_mime(
         sender_email="alice@example.com",
         sender_name="Alice Doe",
         to_email="bob@acme.com",
@@ -45,7 +45,7 @@ def test_build_mime_basic_headers() -> None:
 
 
 def test_build_mime_omits_cc_when_empty() -> None:
-    msg = gmail_send.build_mime(
+    msg, _ = gmail_send.build_mime(
         sender_email="alice@example.com",
         sender_name=None,
         to_email="bob@acme.com",
@@ -59,7 +59,7 @@ def test_build_mime_omits_cc_when_empty() -> None:
 
 def test_build_mime_display_name_with_comma_is_escaped() -> None:
     """RFC-compliant: 'Doe, Alice' must be quoted in From."""
-    msg = gmail_send.build_mime(
+    msg, _ = gmail_send.build_mime(
         sender_email="alice@example.com",
         sender_name='Doe, Alice',
         to_email="bob@acme.com",
@@ -75,7 +75,7 @@ def test_build_mime_display_name_with_comma_is_escaped() -> None:
 
 
 def test_build_mime_no_sender_name_uses_bare_email() -> None:
-    msg = gmail_send.build_mime(
+    msg, _ = gmail_send.build_mime(
         sender_email="alice@example.com",
         sender_name=None,
         to_email="bob@acme.com",
@@ -90,7 +90,7 @@ def test_build_mime_no_sender_name_uses_bare_email() -> None:
 def test_build_mime_flattens_html_body_to_plain_text() -> None:
     # Safety net: a body stored as HTML before the render-time flatten shipped
     # must still reach the recipient as plain text, not literal <p> tags.
-    msg = gmail_send.build_mime(
+    msg, _ = gmail_send.build_mime(
         sender_email="alice@example.com",
         sender_name=None,
         to_email="bob@acme.com",
@@ -105,7 +105,7 @@ def test_build_mime_flattens_html_body_to_plain_text() -> None:
 
 
 def test_encode_for_gmail_is_base64url() -> None:
-    msg = gmail_send.build_mime(
+    msg, _ = gmail_send.build_mime(
         sender_email="a@x.com",
         sender_name=None,
         to_email="b@y.com",

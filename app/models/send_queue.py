@@ -47,6 +47,12 @@ class SendQueue(Base, CreatedAtMixin):
     body_text: Mapped[str | None] = mapped_column(Text)
     gmail_message_id: Mapped[str | None] = mapped_column(String(128))
     gmail_thread_id: Mapped[str | None] = mapped_column(String(128))
+    # RFC822 "Message-ID:" header value (e.g. "<abc@mail.gmail.com>"). NOT the
+    # same as `gmail_message_id` (Gmail's internal API id, e.g. "18a9b3...").
+    # We self-generate this with make_msgid() and set it as the Message-ID
+    # header before send so a follow-up can use it in In-Reply-To / References
+    # — required for threading on non-Gmail MUAs.
+    rfc822_message_id: Mapped[str | None] = mapped_column(String(255))
 
     # Legacy queue fields ─────────────────────────────────────────────
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="INITIAL")

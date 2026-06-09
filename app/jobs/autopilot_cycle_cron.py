@@ -22,7 +22,7 @@ from app.core.time import utcnow
 from app.db.session import SessionLocal
 from app.logging_config import get_logger
 from app.services import batch_generator as batch_gen
-from app.services import reply_ingestor, send_worker
+from app.services import followup_planner, reply_ingestor, send_worker
 
 log = get_logger("autopilot_cycle_cron")
 
@@ -37,6 +37,8 @@ class CycleResult:
     ingest_users_processed: int
     replies_matched: int
     explicit_stops: int
+    # New in 0018 — defaults to 0 so existing test constructors stay valid.
+    followups_planned: int = 0
 
 
 def run_cycle() -> CycleResult:
@@ -44,15 +46,23 @@ def run_cycle() -> CycleResult:
     today = utcnow().date()
     db = SessionLocal()
     try:
-        # 1. Batch generation.
+        # 1. Batch generation (initials only).
         batch_results = batch_gen.generate_batch_for_all_users(db, batch_date=today)
         batch_users = len(batch_results)
         batch_items = sum(r.items_created for r in batch_results)
 
+        # 1b. Plan due follow-ups — adds TBI rows with kind='followup' for any
+        # SENT-but-no-reply send_queue rows older than FOLLOWUP_DELAY_DAYS.
+        # Idempotent (guards on already-planned + same-company-already-busy).
+        followup_summary = followup_planner.plan_due_followups(db, today=today)
+
         # 2. Send drain — picks up any 'ready' items whose send_time has arrived.
+        # Recognises kind='followup' and routes through send_followup() to keep
+        # the email on the original Gmail thread.
         drain = send_worker.drain_due_items(db)
 
-        # 3. Reply ingest.
+        # 3. Reply ingest. Side effect: cancels any pending follow-ups on the
+        # replied-to thread (status='skipped', skip_reason='reply_received').
         ingest_summaries = reply_ingestor.ingest_replies_for_all_users(db)
         replies = sum(s.replies_matched for s in ingest_summaries)
         stops = sum(s.explicit_stops for s in ingest_summaries)
@@ -60,6 +70,7 @@ def run_cycle() -> CycleResult:
         result = CycleResult(
             batch_users_processed=batch_users,
             batch_items_created=batch_items,
+            followups_planned=followup_summary.planned,
             sent=drain.sent,
             failed=drain.failed,
             skipped_sends=drain.skipped,
@@ -71,6 +82,7 @@ def run_cycle() -> CycleResult:
             "autopilot_cycle.done",
             batch_users=batch_users,
             batch_items=batch_items,
+            followups_planned=followup_summary.planned,
             sent=drain.sent,
             failed=drain.failed,
             replies_matched=replies,
