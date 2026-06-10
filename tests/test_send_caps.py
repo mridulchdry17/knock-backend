@@ -20,19 +20,20 @@ def _user(tier: str, daily_limit: int) -> User:
 @pytest.mark.parametrize(
     "tier, daily_limit, expected",
     [
-        # Default daily_limit (20) must NOT lift free above its tier ceiling.
+        # Default daily_limit (20) must NOT lift free above its tier ceiling,
+        # and now clamps paid to its 15 ceiling too.
         ("free", 20, 7),
-        ("paid", 20, 20),
-        ("super_admin", 20, 20),
+        ("paid", 20, 15),
+        ("super_admin", 20, 15),
         # Admin throttle below the tier ceiling wins.
         ("free", 3, 3),
         ("paid", 5, 5),
         # Admin can't raise above the tier ceiling.
-        ("paid", 50, 20),
+        ("paid", 50, 15),
         ("free", 100, 7),
         # daily_limit unset / zero → fall back to the tier default.
         ("free", 0, 7),
-        ("paid", 0, 20),
+        ("paid", 0, 15),
         # Unknown / pending tier → 0 (never sends).
         ("pending", 20, 0),
         ("pending", 0, 0),
