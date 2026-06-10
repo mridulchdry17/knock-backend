@@ -156,12 +156,12 @@ def test_free_user_cap_is_seven(db: Session, free_user: User) -> None:
     assert result.items_created == 7
 
 
-def test_paid_user_cap_is_twenty(db: Session, paid_user: User) -> None:
+def test_paid_user_cap_is_fifteen(db: Session, paid_user: User) -> None:
     _seed_n_companies_with_contacts(db, n=30)
     result = batch_gen_svc.generate_batch_for_user(
         db, paid_user, batch_date=BATCH_DATE, rng=Random(1)
     )
-    assert result.items_created == 20
+    assert result.items_created == 15
 
 
 def test_super_admin_treated_as_paid(db: Session) -> None:
@@ -181,7 +181,7 @@ def test_super_admin_treated_as_paid(db: Session) -> None:
     result = batch_gen_svc.generate_batch_for_user(
         db, user, batch_date=BATCH_DATE, rng=Random(1)
     )
-    assert result.items_created == 20
+    assert result.items_created == 15
 
 
 def test_daily_limit_override_beats_tier_default(db: Session, free_user: User) -> None:

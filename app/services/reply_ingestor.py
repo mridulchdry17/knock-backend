@@ -154,6 +154,31 @@ def _process_reply(
             tbi.status = "replied"
             db.add(tbi)
 
+    # Cancel any pending follow-ups planned against THIS thread — once the
+    # recruiter replied, a bot-style "just bumping this up" follow-up would
+    # be the worst-feeling failure mode of the feature. We mark them skipped
+    # (not deleted) for audit trail.
+    pending_followups = list(
+        db.scalars(
+            select(TodayBatchItem)
+            .where(TodayBatchItem.user_id == user.id)
+            .where(TodayBatchItem.kind == "followup")
+            .where(TodayBatchItem.status.in_(("default", "ready")))
+            .where(
+                TodayBatchItem.parent_send_queue_id.in_(
+                    select(SendQueue.id).where(
+                        SendQueue.user_id == user.id,
+                        SendQueue.gmail_thread_id == reply.gmail_thread_id,
+                    )
+                )
+            )
+        ).all()
+    )
+    for pf in pending_followups:
+        pf.status = "skipped"
+        pf.skip_reason = "reply_received"
+        db.add(pf)
+
     log.info(
         "reply_ingestor.reply_recorded",
         user_id=user.id,
@@ -161,6 +186,7 @@ def _process_reply(
         company_domain=company_domain,
         is_explicit_stop=explicit,
         thread_id=reply.gmail_thread_id,
+        followups_cancelled=len(pending_followups),
     )
 
 

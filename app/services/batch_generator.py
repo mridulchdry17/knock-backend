@@ -35,6 +35,7 @@ from app.repositories import locks as locks_repo
 from app.repositories import preferences as prefs_repo
 from app.repositories import templates as templates_repo
 from app.repositories import today_batch as today_repo
+from app.repositories import user_contact_cooldown as cooldown_repo
 from app.repositories import users as users_repo
 from app.services import send_caps
 from app.services import templates as templates_svc
@@ -221,6 +222,11 @@ def generate_batch_for_user(
     excluded, user_locks, platform_perm, cooldown = _build_filter_sets(
         db, user, now=now
     )
+    # Per-user "I already emailed this contact" 30-day cooldown — keeps
+    # tomorrow's batch fresh by skipping contacts this user has touched recently.
+    blocked_contact_ids = cooldown_repo.list_blocked_contact_ids(
+        db, user.id, now=now
+    )
 
     picks = pick_companies_for_user(
         user_id=user.id,
@@ -230,6 +236,7 @@ def generate_batch_for_user(
         blocked_user_lock_domains=user_locks,
         blocked_platform_permanent_domains=platform_perm,
         cooldown_domains=cooldown,
+        blocked_contact_ids=blocked_contact_ids,
         batch_date=batch_date,
         tier=user.tier,  # type: ignore[arg-type]
         rng=rng,

@@ -15,7 +15,7 @@ import io
 from datetime import timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app.core.deps import DbDep, SuperAdminUser
@@ -246,7 +246,7 @@ def approve_waitlist_entry(
     _admin: SuperAdminUser,
     db: DbDep,
     entry_id: int,
-    payload: ApproveWaitlistIn | None = Body(default=None),
+    payload: ApproveWaitlistIn | None = None,
 ) -> AdminWaitlistOut:
     """Allow a waitlist entry in. Empty body / `{tier:'free'}` = the legacy
     default (Allow → free); `{tier:'paid'}` pre-marks the entry so the user

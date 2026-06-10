@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass
 from email.headerregistry import Address
 from email.message import EmailMessage
+from email.utils import make_msgid
 from typing import TYPE_CHECKING, Any
 
 from googleapiclient.discovery import build
@@ -41,11 +42,17 @@ class SendResult:
 
     On success: ok=True, gmail_message_id is set, all error fields None.
     On failure: ok=False, gmail_message_id None, failure_kind/error_message set.
+
+    `rfc822_message_id` is the literal "Message-ID:" header value we generated
+    pre-send (e.g. "<abc@mail.gmail.com>"). Distinct from gmail_message_id
+    (Gmail's API id). Persisted on send_queue so a follow-up can build the
+    In-Reply-To / References headers without a second Gmail API roundtrip.
     """
 
     ok: bool
     gmail_message_id: str | None = None
     gmail_thread_id: str | None = None
+    rfc822_message_id: str | None = None
     failure_kind: str | None = None
     gmail_error_code: str | None = None
     error_message: str | None = None
@@ -62,11 +69,20 @@ def build_mime(
     cc_emails: list[str],
     subject: str,
     body_text: str,
-) -> EmailMessage:
+    in_reply_to_rfc822_id: str | None = None,
+    references_rfc822_ids: list[str] | None = None,
+) -> tuple[EmailMessage, str]:
     """Build a text/plain EmailMessage with properly-encoded headers.
 
-    Using Address() (rather than f-string concatenation) gets RFC-compliant
-    display-name encoding for free — quotes/commas/non-ASCII names are handled.
+    Returns (msg, rfc822_message_id) — the Message-ID we self-generated and set
+    on the outgoing message. We control it (vs. letting Gmail assign one) so
+    a later follow-up can put it in In-Reply-To / References without a second
+    API roundtrip.
+
+    `in_reply_to_rfc822_id` + `references_rfc822_ids` enable threading on
+    non-Gmail MUAs (Gmail uses its own `threadId` on the API call). Both are
+    optional; when set, they're the RFC822 Message-ID values of prior
+    messages in the chain (already wrapped in '<…>' or not — we normalize).
     """
     msg = EmailMessage()
 
@@ -81,12 +97,37 @@ def build_mime(
         msg["Cc"] = ", ".join(cc_emails)
     msg["Subject"] = subject
 
+    # Self-controlled Message-ID — domain comes from the sender's address so it
+    # looks legitimate to spam filters.
+    sender_domain = sender_email.partition("@")[2] or "knock.app"
+    rfc822_id = make_msgid(domain=sender_domain)
+    msg["Message-ID"] = rfc822_id
+
+    if in_reply_to_rfc822_id:
+        normalized = _wrap_msgid(in_reply_to_rfc822_id)
+        msg["In-Reply-To"] = normalized
+        # References = full chain history; if caller didn't pass the chain, at
+        # least include the immediate parent so threading works.
+        if references_rfc822_ids:
+            msg["References"] = " ".join(_wrap_msgid(r) for r in references_rfc822_ids)
+        else:
+            msg["References"] = normalized
+
     # Safety net: render_template already flattens HTML, but a body that was
     # stored as HTML before this shipped (or any path that bypasses render)
     # would otherwise reach the recipient with literal <p>…</p> tags, since
     # the message is text/plain. Idempotent on already-plain text.
     msg.set_content(html_to_text(body_text))
-    return msg
+    return msg, rfc822_id
+
+
+def _wrap_msgid(value: str) -> str:
+    """Normalize a Message-ID to its angle-bracketed form. make_msgid() already
+    produces `<…>` but we accept either shape for caller convenience."""
+    v = value.strip()
+    if v.startswith("<") and v.endswith(">"):
+        return v
+    return f"<{v}>"
 
 
 def _encode_for_gmail(msg: EmailMessage) -> str:
@@ -191,7 +232,7 @@ def send_email(
       - on failure_kind=='gmail_auth_revoked' → also flip user.gmail_disconnected.
       - on others → just log + insert email_failures row.
     """
-    msg = build_mime(
+    msg, rfc822_id = build_mime(
         sender_email=sender_email,
         sender_name=sender_name,
         to_email=to_email,
@@ -199,15 +240,64 @@ def send_email(
         subject=subject,
         body_text=body_text,
     )
+    return _dispatch(msg, rfc822_id, creds, thread_id=None)
 
+
+def send_followup(
+    creds: Credentials,
+    *,
+    sender_email: str,
+    sender_name: str | None,
+    to_email: str,
+    cc_emails: list[str],
+    subject: str,
+    body_text: str,
+    gmail_thread_id: str,
+    in_reply_to_rfc822_id: str | None,
+    references_rfc822_ids: list[str] | None = None,
+) -> SendResult:
+    """Send a follow-up that lands on the SAME Gmail thread as the original.
+
+    Threading mechanics:
+      - Gmail-side: pass `threadId` on the API body so Gmail groups it.
+      - Universal: set `In-Reply-To` + `References` headers so non-Gmail MUAs
+        also thread it (mostly belt-and-suspenders since recruiters are mostly
+        on Gmail, but free correctness).
+      - Subject: caller is responsible for the "Re: " prefix (kept here so the
+        function stays mechanical — no string surgery on a user-authored body).
+    """
+    msg, rfc822_id = build_mime(
+        sender_email=sender_email,
+        sender_name=sender_name,
+        to_email=to_email,
+        cc_emails=cc_emails,
+        subject=subject,
+        body_text=body_text,
+        in_reply_to_rfc822_id=in_reply_to_rfc822_id,
+        references_rfc822_ids=references_rfc822_ids,
+    )
+    return _dispatch(msg, rfc822_id, creds, thread_id=gmail_thread_id)
+
+
+def _dispatch(
+    msg: EmailMessage,
+    rfc822_id: str,
+    creds: Credentials,
+    *,
+    thread_id: str | None,
+) -> SendResult:
+    """Common send path — never raises, always returns SendResult."""
     try:
         service = _build_service(creds)
-        body = {"raw": _encode_for_gmail(msg)}
+        body: dict[str, Any] = {"raw": _encode_for_gmail(msg)}
+        if thread_id:
+            body["threadId"] = thread_id
         response = service.users().messages().send(userId="me", body=body).execute()
         return SendResult(
             ok=True,
             gmail_message_id=response.get("id"),
             gmail_thread_id=response.get("threadId"),
+            rfc822_message_id=rfc822_id,
         )
     except HttpError as e:
         kind, code, message = classify_http_error(e)

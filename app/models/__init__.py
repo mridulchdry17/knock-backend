@@ -12,6 +12,7 @@ from app.models.template import Template
 from app.models.today_batch_item import TodayBatchItem
 from app.models.user import User
 from app.models.user_company_lock import UserCompanyLock
+from app.models.user_contact_cooldown import UserContactCooldown
 from app.models.user_contact_map import UserContactMap
 from app.models.user_contact_note import UserContactNote
 from app.models.user_excluded_domain import UserExcludedDomain
@@ -31,6 +32,7 @@ __all__ = [
     "TodayBatchItem",
     "User",
     "UserCompanyLock",
+    "UserContactCooldown",
     "UserContactMap",
     "UserContactNote",
     "UserExcludedDomain",

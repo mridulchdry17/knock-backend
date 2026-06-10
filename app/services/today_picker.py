@@ -12,8 +12,8 @@ inside the picker doesn't matter — any membership rejects.
 
 Send-time scheduling (UTC for v0):
   - Free tier (cap=7): 1/hour starting 6am → 6am, 7am, ..., 12pm.
-  - Paid tier (cap=20): evenly spaced across the 6am-8pm UTC window so paid
-    users still sleep. With 20 slots over 14 hours that's ~44 minutes apart.
+  - Paid tier (cap=15): evenly spaced across the 6am-8pm UTC window so paid
+    users still sleep. With 15 slots over 14 hours that's ~60 minutes apart.
     Per-user timezone is future work; v0 schedules in server UTC.
 """
 from __future__ import annotations
@@ -64,7 +64,7 @@ def compute_send_times(batch_date: date, count: int, tier: Tier) -> list[datetim
     Free: 1/hour starting 6am UTC (count<=7 keeps everything within working
     hours; if a future free cap exceeds 7 we'd wrap past noon, which is fine).
     Paid: evenly distributed across 6am-8pm UTC (~14 hours / count). With the
-    default paid cap of 20 that's ~44min per slot.
+    default paid cap of 15 that's ~60min per slot.
     super_admin: treated as paid for scheduling purposes.
     """
     if count <= 0:
@@ -115,17 +115,23 @@ def pick_companies_for_user(
     blocked_user_lock_domains: set[str],
     blocked_platform_permanent_domains: set[str],
     cooldown_domains: set[str],
+    blocked_contact_ids: set[int] | None = None,
     batch_date: date,
     tier: Tier,
     rng: Random,
 ) -> list[CompanyPick]:
     """Pure: returns up to `cap` company picks for one user's daily batch.
 
-    Filters (any membership rejects the company):
+    Domain-level filters (any membership rejects the company):
       - `excluded_domains`: user's exclusion list
-      - `blocked_user_lock_domains`: this user's active 30-day reply locks
+      - `blocked_user_lock_domains`: this user's active reply locks (2 days)
       - `blocked_platform_permanent_domains`: explicit-stop permanent locks
       - `cooldown_domains`: active 36h platform cooldowns
+
+    Contact-level filter (drops the contact before grouping):
+      - `blocked_contact_ids`: this user's 30-day "I already emailed them"
+        cooldown — keyed on contact, not domain, so the picker can still rotate
+        OTHER contacts at the same company once the platform 36h hold expires.
 
     Within an eligible company:
       - sample up to 5 contacts (1 TO + up to 4 CC)
@@ -137,7 +143,14 @@ def pick_companies_for_user(
     if cap <= 0:
         return []
 
-    grouped = _group_by_company(candidates)
+    blocked_contact_ids = blocked_contact_ids or set()
+
+    # Drop contacts the user is in a personal cooldown for BEFORE grouping —
+    # a company keeps eligibility iff at least one un-cooled contact survives.
+    eligible_candidates = [
+        c for c in candidates if c.contact_id not in blocked_contact_ids
+    ]
+    grouped = _group_by_company(eligible_candidates)
 
     blocked = (
         excluded_domains

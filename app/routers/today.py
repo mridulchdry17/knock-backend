@@ -10,14 +10,19 @@ them to /awaiting-approval).
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, status
+from sqlalchemy import select
 
 from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
 from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
-from app.models import Company, Contact, TodayBatchItem
+from app.models import Company, Contact, SendQueue, Template, TodayBatchItem
+from app.repositories import templates as templates_repo
 from app.repositories import today_batch as today_repo
 from app.schemas.today import (
+    ApplyTemplateIn,
+    ApplyTemplateResultOut,
+    ParentSendSummaryOut,
     RecipientOut,
     SendBatchResultOut,
     SkipTodayResultOut,
@@ -27,6 +32,7 @@ from app.schemas.today import (
 )
 from app.services import batch_generator as batch_gen_svc
 from app.services import send_caps, send_worker
+from app.services import templates as templates_svc
 
 router = APIRouter(
     prefix="/api/v1/today",
@@ -61,6 +67,8 @@ def _item_to_out(
     *,
     contacts_by_id: dict[int, Contact],
     company: Company | None,
+    parent_by_id: dict[int, SendQueue] | None = None,
+    template_name_by_id: dict[int, str] | None = None,
 ) -> TodayItemOut:
     # If the company row vanished (cascade somehow lost it) fall back to the
     # denormalized domain to keep the response usable. Defensive — shouldn't
@@ -94,14 +102,34 @@ def _item_to_out(
             continue
         cc_recipients.append(_recipient_from_contact(cc_contact, company))
 
+    # Follow-up cards carry the originating send's subject/body/sent_at so the
+    # reading pane can show "Sent 4 days ago · no reply yet" with the prose
+    # collapsed below. parent_by_id is keyed on send_queue.id; absent on
+    # initial cards.
+    parent_out: ParentSendSummaryOut | None = None
+    if (
+        item.kind == "followup"
+        and item.parent_send_queue_id is not None
+        and parent_by_id is not None
+    ):
+        parent_sq = parent_by_id.get(item.parent_send_queue_id)
+        if parent_sq is not None and parent_sq.sent_at is not None:
+            parent_out = ParentSendSummaryOut(
+                original_subject=parent_sq.subject or "",
+                original_body=parent_sq.body_text or "",
+                original_sent_at=ensure_utc(parent_sq.sent_at),
+            )
+
     return TodayItemOut(
         id=str(item.id),
         recipient=to_recipient,
         cc_recipients=cc_recipients,
         template_id=str(item.template_id) if item.template_id is not None else None,
-        # template_name resolved at the router layer when templates ship in
-        # B5.7. v0: always None.
-        template_name=None,
+        template_name=(
+            template_name_by_id.get(item.template_id)
+            if (template_name_by_id is not None and item.template_id is not None)
+            else None
+        ),
         subject=item.subject,
         body_preview=_body_preview(item.body),
         body=item.body,
@@ -113,24 +141,31 @@ def _item_to_out(
         status=item.status,  # type: ignore[arg-type]
         cooldown_until=None,
         sent_at=None,
+        kind=item.kind if item.kind in ("initial", "followup") else "initial",  # type: ignore[arg-type]
+        followup_index=item.followup_index,
+        parent=parent_out,
     )
 
 
 def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
-    """Bulk-fetch contacts + companies for all items in one round-trip each.
-    Beats the N+1 we'd get from looking them up per-item.
+    """Bulk-fetch contacts + companies + (for follow-ups) parent send_queue rows
+    in one round-trip each. Beats the N+1 we'd get from looking them up per-item.
     """
     if not items:
         return []
 
     contact_ids: set[int] = set()
     company_ids: set[int] = set()
+    parent_send_queue_ids: set[int] = set()
+    template_ids: set[int] = set()
     for item in items:
         contact_ids.add(item.to_contact_id)
         contact_ids.update(item.get_cc_contact_ids())
         company_ids.add(item.company_id)
-
-    from sqlalchemy import select
+        if item.parent_send_queue_id is not None:
+            parent_send_queue_ids.add(item.parent_send_queue_id)
+        if item.template_id is not None:
+            template_ids.add(item.template_id)
 
     contacts_by_id = {
         c.id: c
@@ -140,12 +175,28 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
         co.id: co
         for co in db.scalars(select(Company).where(Company.id.in_(company_ids))).all()
     }
+    parent_by_id: dict[int, SendQueue] = {}
+    if parent_send_queue_ids:
+        parent_by_id = {
+            sq.id: sq
+            for sq in db.scalars(
+                select(SendQueue).where(SendQueue.id.in_(parent_send_queue_ids))
+            ).all()
+        }
+    template_name_by_id: dict[int, str] = {}
+    if template_ids:
+        template_name_by_id = {
+            t.id: t.name
+            for t in db.scalars(select(Template).where(Template.id.in_(template_ids))).all()
+        }
 
     return [
         _item_to_out(
             item,
             contacts_by_id=contacts_by_id,
             company=companies_by_id.get(item.company_id),
+            parent_by_id=parent_by_id,
+            template_name_by_id=template_name_by_id,
         )
         for item in items
     ]
@@ -235,18 +286,56 @@ def update_today_item(
         )
 
     content_touched = False
+    # Template swap: validate ownership, then re-render subject + body with the
+    # card's recipient/company placeholders. Overwrites any in-flight edits —
+    # the mental model is "I'm picking which template fires," not "preserve my
+    # tweaks." Apply BEFORE the explicit subject/body overrides so a same-PATCH
+    # subject/body still wins (rare but lets a power-user template-then-tweak
+    # in one request).
+    if payload.template_id is not None:
+        template = templates_repo.get(db, int(payload.template_id))
+        if template is None or template.user_id != user.id:
+            raise ApiError(
+                "template_not_found",
+                "Template not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        to_contact = db.get(Contact, item.to_contact_id) if item.to_contact_id else None
+        company = db.get(Company, item.company_id) if item.company_id else None
+        sender_name = user.sender_signature_name or user.full_name
+        rendered_subject, rendered_body = templates_svc.render_template(
+            template.subject,
+            template.body,
+            to_contact=to_contact,
+            company=company,
+            sender_name=sender_name,
+        )
+        item.template_id = int(payload.template_id)
+        item.subject = rendered_subject
+        item.body = rendered_body
+        # Template swap = fresh render, so the card is no longer "personalized."
+        # A later batch-template-apply should rewrite this card normally.
+        item.edited_at = None
+        content_touched = True
+
+    # `manually_touched` tracks whether the user actually typed in
+    # subject/body — those are what we preserve during batch-template-apply.
+    # send_time changes don't count as "personalized content."
+    manually_touched = False
     if payload.subject is not None:
         item.subject = payload.subject
         content_touched = True
+        manually_touched = True
     if payload.body is not None:
         item.body = payload.body
         content_touched = True
+        manually_touched = True
     if payload.send_time is not None:
         item.send_time = payload.send_time
         content_touched = True
-    if payload.template_id is not None:
-        item.template_id = payload.template_id
-        content_touched = True
+
+    if manually_touched:
+        item.edited_at = utcnow()
 
     if payload.status is not None:
         item.status = payload.status
@@ -338,3 +427,90 @@ def skip_today(user: CurrentUser, db: DbDep) -> SkipTodayResultOut:
 
     log.info("today.skip_today", user_id=user.id, skipped=skipped)
     return SkipTodayResultOut(skipped=True)
+
+
+@router.post("/apply-template", response_model=ApplyTemplateResultOut)
+def apply_template_to_batch(
+    payload: ApplyTemplateIn,
+    user: CurrentUser,
+    db: DbDep,
+) -> ApplyTemplateResultOut:
+    """Re-render every editable card in today's batch with `template_id`.
+
+    Skips cards where the user has manually edited subject or body
+    (`edited_at IS NOT NULL`) — those represent personalization the user is
+    unlikely to want overwritten. Terminal-state cards (sent/failed/skipped/
+    cooldown) are also skipped — they're frozen.
+
+    A 'default' card whose render gets rewritten is promoted to 'ready'
+    automatically (same edit=approval rule as PATCH /items).
+
+    Returns the breakdown so the frontend can show
+    "Rewrote N cards · M kept your edits".
+    """
+    template = templates_repo.get(db, payload.template_id)
+    if template is None or template.user_id != user.id:
+        raise ApiError(
+            "template_not_found",
+            "Template not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    today = utcnow().date()
+    items = today_repo.list_for_user_date(db, user.id, today)
+
+    # Batch-fetch the contacts/companies we'll touch so we're not doing
+    # per-card lookups inside the render loop.
+    contact_ids = {i.to_contact_id for i in items if i.to_contact_id}
+    company_ids = {i.company_id for i in items if i.company_id}
+    contacts_by_id: dict[int, Contact] = {
+        c.id: c
+        for c in db.scalars(select(Contact).where(Contact.id.in_(contact_ids))).all()
+    } if contact_ids else {}
+    companies_by_id: dict[int, Company] = {
+        c.id: c
+        for c in db.scalars(select(Company).where(Company.id.in_(company_ids))).all()
+    } if company_ids else {}
+
+    sender_name = user.sender_signature_name or user.full_name
+
+    rewritten = 0
+    kept_edited = 0
+    skipped_terminal = 0
+    for item in items:
+        if item.status in ("sent", "failed", "skipped", "cooldown"):
+            skipped_terminal += 1
+            continue
+        if item.edited_at is not None:
+            kept_edited += 1
+            continue
+        rendered_subject, rendered_body = templates_svc.render_template(
+            template.subject,
+            template.body,
+            to_contact=contacts_by_id.get(item.to_contact_id),
+            company=companies_by_id.get(item.company_id),
+            sender_name=sender_name,
+        )
+        item.template_id = template.id
+        item.subject = rendered_subject
+        item.body = rendered_body
+        if item.status == "default":
+            item.status = "ready"
+        db.add(item)
+        rewritten += 1
+
+    db.commit()
+
+    log.info(
+        "today.apply_template",
+        user_id=user.id,
+        template_id=template.id,
+        rewritten=rewritten,
+        kept_edited=kept_edited,
+        skipped_terminal=skipped_terminal,
+    )
+    return ApplyTemplateResultOut(
+        rewritten=rewritten,
+        kept_edited=kept_edited,
+        skipped_terminal=skipped_terminal,
+    )
