@@ -241,6 +241,78 @@ def test_patch_item_belonging_to_another_user_returns_404(
     assert r.status_code == 404
 
 
+def test_patch_template_id_rerenders_subject_and_body(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Picking a new template via PATCH must re-render the card's subject/body
+    using the template's placeholders against the card's recipient — NOT just
+    swap the FK."""
+    from app.models import Template
+
+    _seed_pool(db, n=1)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    # Custom template owned by this user.
+    tmpl = Template(
+        user_id=free_user.id,
+        name="Cool Opener",
+        subject="Hi from {{first_name}}",
+        body="Hey {{first_name}}, loved {{company}}.",
+        is_starter=False,
+    )
+    db.add(tmpl)
+    db.commit()
+
+    client = client_factory(free_user)
+    item_id = client.get("/api/v1/today").json()["items"][0]["id"]
+
+    r = client.patch(
+        f"/api/v1/today/items/{item_id}",
+        json={"template_id": tmpl.id},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["template_id"] == str(tmpl.id)
+    assert out["template_name"] == "Cool Opener"
+    # Placeholders rendered with the contact's actual first name + company.
+    assert "Hey User" in out["body"] or out["body"].startswith("Hey ")
+    assert "loved Co " in out["body"] or "loved " in out["body"]
+    # Editing the template auto-promotes status to 'ready'.
+    assert out["status"] == "ready"
+
+
+def test_patch_template_id_belonging_to_another_user_404(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Cross-user template use must 404 — don't leak existence of another
+    user's templates via 403."""
+    from app.models import Template
+
+    _seed_pool(db, n=1)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    other = _make_user(
+        db, email="other@x.com", google_sub="g-other2", tier="free",
+        waitlist_email="other@x.com",
+    )
+    other_template = Template(
+        user_id=other.id, name="Theirs", subject="x", body="y", is_starter=False,
+    )
+    db.add(other_template)
+    db.commit()
+
+    client = client_factory(free_user)
+    item_id = client.get("/api/v1/today").json()["items"][0]["id"]
+
+    r = client.patch(
+        f"/api/v1/today/items/{item_id}",
+        json={"template_id": other_template.id},
+    )
+    assert r.status_code == 404
+
+
 def test_patch_explicit_status_wins_over_edit_auto_ready(
     client_factory, db: Session, free_user: User
 ) -> None:
