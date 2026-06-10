@@ -15,7 +15,8 @@ from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
 from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
-from app.models import Company, Contact, SendQueue, TodayBatchItem
+from app.models import Company, Contact, SendQueue, Template, TodayBatchItem
+from app.repositories import templates as templates_repo
 from app.repositories import today_batch as today_repo
 from app.schemas.today import (
     ParentSendSummaryOut,
@@ -28,6 +29,7 @@ from app.schemas.today import (
 )
 from app.services import batch_generator as batch_gen_svc
 from app.services import send_caps, send_worker
+from app.services import templates as templates_svc
 
 router = APIRouter(
     prefix="/api/v1/today",
@@ -63,6 +65,7 @@ def _item_to_out(
     contacts_by_id: dict[int, Contact],
     company: Company | None,
     parent_by_id: dict[int, SendQueue] | None = None,
+    template_name_by_id: dict[int, str] | None = None,
 ) -> TodayItemOut:
     # If the company row vanished (cascade somehow lost it) fall back to the
     # denormalized domain to keep the response usable. Defensive — shouldn't
@@ -119,9 +122,11 @@ def _item_to_out(
         recipient=to_recipient,
         cc_recipients=cc_recipients,
         template_id=str(item.template_id) if item.template_id is not None else None,
-        # template_name resolved at the router layer when templates ship in
-        # B5.7. v0: always None.
-        template_name=None,
+        template_name=(
+            template_name_by_id.get(item.template_id)
+            if (template_name_by_id is not None and item.template_id is not None)
+            else None
+        ),
         subject=item.subject,
         body_preview=_body_preview(item.body),
         body=item.body,
@@ -149,12 +154,15 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
     contact_ids: set[int] = set()
     company_ids: set[int] = set()
     parent_send_queue_ids: set[int] = set()
+    template_ids: set[int] = set()
     for item in items:
         contact_ids.add(item.to_contact_id)
         contact_ids.update(item.get_cc_contact_ids())
         company_ids.add(item.company_id)
         if item.parent_send_queue_id is not None:
             parent_send_queue_ids.add(item.parent_send_queue_id)
+        if item.template_id is not None:
+            template_ids.add(item.template_id)
 
     from sqlalchemy import select
 
@@ -174,6 +182,12 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
                 select(SendQueue).where(SendQueue.id.in_(parent_send_queue_ids))
             ).all()
         }
+    template_name_by_id: dict[int, str] = {}
+    if template_ids:
+        template_name_by_id = {
+            t.id: t.name
+            for t in db.scalars(select(Template).where(Template.id.in_(template_ids))).all()
+        }
 
     return [
         _item_to_out(
@@ -181,6 +195,7 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
             contacts_by_id=contacts_by_id,
             company=companies_by_id.get(item.company_id),
             parent_by_id=parent_by_id,
+            template_name_by_id=template_name_by_id,
         )
         for item in items
     ]
@@ -270,6 +285,35 @@ def update_today_item(
         )
 
     content_touched = False
+    # Template swap: validate ownership, then re-render subject + body with the
+    # card's recipient/company placeholders. Overwrites any in-flight edits —
+    # the mental model is "I'm picking which template fires," not "preserve my
+    # tweaks." Apply BEFORE the explicit subject/body overrides so a same-PATCH
+    # subject/body still wins (rare but lets a power-user template-then-tweak
+    # in one request).
+    if payload.template_id is not None:
+        template = templates_repo.get(db, int(payload.template_id))
+        if template is None or template.user_id != user.id:
+            raise ApiError(
+                "template_not_found",
+                "Template not found.",
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        to_contact = db.get(Contact, item.to_contact_id) if item.to_contact_id else None
+        company = db.get(Company, item.company_id) if item.company_id else None
+        sender_name = user.sender_signature_name or user.full_name
+        rendered_subject, rendered_body = templates_svc.render_template(
+            template.subject,
+            template.body,
+            to_contact=to_contact,
+            company=company,
+            sender_name=sender_name,
+        )
+        item.template_id = int(payload.template_id)
+        item.subject = rendered_subject
+        item.body = rendered_body
+        content_touched = True
+
     if payload.subject is not None:
         item.subject = payload.subject
         content_touched = True
@@ -278,9 +322,6 @@ def update_today_item(
         content_touched = True
     if payload.send_time is not None:
         item.send_time = payload.send_time
-        content_touched = True
-    if payload.template_id is not None:
-        item.template_id = payload.template_id
         content_touched = True
 
     if payload.status is not None:
