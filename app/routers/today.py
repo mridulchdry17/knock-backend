@@ -10,6 +10,7 @@ them to /awaiting-approval).
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, status
+from sqlalchemy import select
 
 from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
@@ -19,6 +20,8 @@ from app.models import Company, Contact, SendQueue, Template, TodayBatchItem
 from app.repositories import templates as templates_repo
 from app.repositories import today_batch as today_repo
 from app.schemas.today import (
+    ApplyTemplateIn,
+    ApplyTemplateResultOut,
     ParentSendSummaryOut,
     RecipientOut,
     SendBatchResultOut,
@@ -163,8 +166,6 @@ def _hydrate(db, items: list[TodayBatchItem]) -> list[TodayItemOut]:
             parent_send_queue_ids.add(item.parent_send_queue_id)
         if item.template_id is not None:
             template_ids.add(item.template_id)
-
-    from sqlalchemy import select
 
     contacts_by_id = {
         c.id: c
@@ -312,17 +313,29 @@ def update_today_item(
         item.template_id = int(payload.template_id)
         item.subject = rendered_subject
         item.body = rendered_body
+        # Template swap = fresh render, so the card is no longer "personalized."
+        # A later batch-template-apply should rewrite this card normally.
+        item.edited_at = None
         content_touched = True
 
+    # `manually_touched` tracks whether the user actually typed in
+    # subject/body — those are what we preserve during batch-template-apply.
+    # send_time changes don't count as "personalized content."
+    manually_touched = False
     if payload.subject is not None:
         item.subject = payload.subject
         content_touched = True
+        manually_touched = True
     if payload.body is not None:
         item.body = payload.body
         content_touched = True
+        manually_touched = True
     if payload.send_time is not None:
         item.send_time = payload.send_time
         content_touched = True
+
+    if manually_touched:
+        item.edited_at = utcnow()
 
     if payload.status is not None:
         item.status = payload.status
@@ -414,3 +427,90 @@ def skip_today(user: CurrentUser, db: DbDep) -> SkipTodayResultOut:
 
     log.info("today.skip_today", user_id=user.id, skipped=skipped)
     return SkipTodayResultOut(skipped=True)
+
+
+@router.post("/apply-template", response_model=ApplyTemplateResultOut)
+def apply_template_to_batch(
+    payload: ApplyTemplateIn,
+    user: CurrentUser,
+    db: DbDep,
+) -> ApplyTemplateResultOut:
+    """Re-render every editable card in today's batch with `template_id`.
+
+    Skips cards where the user has manually edited subject or body
+    (`edited_at IS NOT NULL`) — those represent personalization the user is
+    unlikely to want overwritten. Terminal-state cards (sent/failed/skipped/
+    cooldown) are also skipped — they're frozen.
+
+    A 'default' card whose render gets rewritten is promoted to 'ready'
+    automatically (same edit=approval rule as PATCH /items).
+
+    Returns the breakdown so the frontend can show
+    "Rewrote N cards · M kept your edits".
+    """
+    template = templates_repo.get(db, payload.template_id)
+    if template is None or template.user_id != user.id:
+        raise ApiError(
+            "template_not_found",
+            "Template not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    today = utcnow().date()
+    items = today_repo.list_for_user_date(db, user.id, today)
+
+    # Batch-fetch the contacts/companies we'll touch so we're not doing
+    # per-card lookups inside the render loop.
+    contact_ids = {i.to_contact_id for i in items if i.to_contact_id}
+    company_ids = {i.company_id for i in items if i.company_id}
+    contacts_by_id: dict[int, Contact] = {
+        c.id: c
+        for c in db.scalars(select(Contact).where(Contact.id.in_(contact_ids))).all()
+    } if contact_ids else {}
+    companies_by_id: dict[int, Company] = {
+        c.id: c
+        for c in db.scalars(select(Company).where(Company.id.in_(company_ids))).all()
+    } if company_ids else {}
+
+    sender_name = user.sender_signature_name or user.full_name
+
+    rewritten = 0
+    kept_edited = 0
+    skipped_terminal = 0
+    for item in items:
+        if item.status in ("sent", "failed", "skipped", "cooldown"):
+            skipped_terminal += 1
+            continue
+        if item.edited_at is not None:
+            kept_edited += 1
+            continue
+        rendered_subject, rendered_body = templates_svc.render_template(
+            template.subject,
+            template.body,
+            to_contact=contacts_by_id.get(item.to_contact_id),
+            company=companies_by_id.get(item.company_id),
+            sender_name=sender_name,
+        )
+        item.template_id = template.id
+        item.subject = rendered_subject
+        item.body = rendered_body
+        if item.status == "default":
+            item.status = "ready"
+        db.add(item)
+        rewritten += 1
+
+    db.commit()
+
+    log.info(
+        "today.apply_template",
+        user_id=user.id,
+        template_id=template.id,
+        rewritten=rewritten,
+        kept_edited=kept_edited,
+        skipped_terminal=skipped_terminal,
+    )
+    return ApplyTemplateResultOut(
+        rewritten=rewritten,
+        kept_edited=kept_edited,
+        skipped_terminal=skipped_terminal,
+    )

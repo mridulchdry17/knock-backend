@@ -313,6 +313,164 @@ def test_patch_template_id_belonging_to_another_user_404(
     assert r.status_code == 404
 
 
+# ─────────────────────────── POST /today/apply-template ──────────────────────
+
+
+def _seed_user_template(db: Session, user: User, name: str = "T1"):
+    from app.models import Template
+
+    t = Template(
+        user_id=user.id,
+        name=name,
+        subject="Hi from {{first_name}}",
+        body="Hey {{first_name}}, loved {{company}}.",
+        is_starter=False,
+    )
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    return t
+
+
+def test_apply_template_rewrites_all_pristine_cards(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Batch-apply re-renders every pristine (un-edited, non-terminal) card."""
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    tmpl = _seed_user_template(db, free_user, name="Cool Opener")
+
+    client = client_factory(free_user)
+    r = client.post("/api/v1/today/apply-template", json={"template_id": tmpl.id})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["rewritten"] >= 1
+    assert out["kept_edited"] == 0
+    assert out["skipped_terminal"] == 0
+
+    # Every card now uses the new template + the placeholder text.
+    items = client.get("/api/v1/today").json()["items"]
+    assert all(it["template_id"] == str(tmpl.id) for it in items)
+    assert all(it["subject"].startswith("Hi from ") for it in items)
+    # 'default' → 'ready' on rewrite.
+    assert all(it["status"] in ("ready", "sent", "skipped") for it in items)
+
+
+def test_apply_template_preserves_manually_edited_cards(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """A card the user edited (subject or body via PATCH) must NOT be rewritten."""
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+    items = client.get("/api/v1/today").json()["items"]
+    edited_id = items[0]["id"]
+
+    # Edit the first card's subject — sets edited_at.
+    r = client.patch(
+        f"/api/v1/today/items/{edited_id}",
+        json={"subject": "MY personalized line"},
+    )
+    assert r.status_code == 200
+
+    tmpl = _seed_user_template(db, free_user, name="Cool Opener")
+    r = client.post("/api/v1/today/apply-template", json={"template_id": tmpl.id})
+    assert r.status_code == 200
+    assert r.json()["kept_edited"] == 1
+
+    # The edited card kept its custom subject.
+    refreshed = client.get("/api/v1/today").json()["items"]
+    by_id = {it["id"]: it for it in refreshed}
+    assert by_id[edited_id]["subject"] == "MY personalized line"
+    # The others got rewritten.
+    others = [it for it in refreshed if it["id"] != edited_id]
+    assert all(it["template_id"] == str(tmpl.id) for it in others)
+
+
+def test_apply_template_skips_terminal_cards(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """sent / failed / skipped / cooldown cards are not rewritten."""
+    _seed_pool(db, n=2)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+    items = client.get("/api/v1/today").json()["items"]
+    skip_id = items[0]["id"]
+    r = client.patch(f"/api/v1/today/items/{skip_id}", json={"status": "skipped"})
+    assert r.status_code == 200
+
+    tmpl = _seed_user_template(db, free_user, name="X")
+    r = client.post("/api/v1/today/apply-template", json={"template_id": tmpl.id})
+    assert r.status_code == 200
+    out = r.json()
+    assert out["skipped_terminal"] >= 1
+
+    refreshed = client.get("/api/v1/today").json()["items"]
+    by_id = {it["id"]: it for it in refreshed}
+    # Skipped card kept its OLD template_id (not the new one).
+    assert by_id[skip_id]["template_id"] != str(tmpl.id) or by_id[skip_id]["status"] == "skipped"
+
+
+def test_apply_template_cross_user_404(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Applying another user's template must 404."""
+    _seed_pool(db, n=1)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    other = _make_user(
+        db, email="other@x.com", google_sub="g-other3", tier="free",
+        waitlist_email="other@x.com",
+    )
+    others_tpl = _seed_user_template(db, other, name="Theirs")
+
+    client = client_factory(free_user)
+    r = client.post("/api/v1/today/apply-template", json={"template_id": others_tpl.id})
+    assert r.status_code == 404
+
+
+def test_template_swap_clears_edited_at(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """A PATCH that swaps template_id must clear edited_at — so a subsequent
+    batch-apply includes the card again."""
+    _seed_pool(db, n=2)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    client = client_factory(free_user)
+    item_id = client.get("/api/v1/today").json()["items"][0]["id"]
+
+    # User edits the subject → edited_at gets set.
+    r = client.patch(f"/api/v1/today/items/{item_id}", json={"subject": "tweaked"})
+    assert r.status_code == 200
+
+    # User changes their mind, picks a different template → edited_at clears.
+    swap_tpl = _seed_user_template(db, free_user, name="Swap")
+    r = client.patch(
+        f"/api/v1/today/items/{item_id}",
+        json={"template_id": swap_tpl.id},
+    )
+    assert r.status_code == 200
+
+    # Batch-apply with yet another template now includes the card.
+    final_tpl = _seed_user_template(db, free_user, name="Final")
+    r = client.post("/api/v1/today/apply-template", json={"template_id": final_tpl.id})
+    assert r.status_code == 200
+    assert r.json()["kept_edited"] == 0
+
+    refreshed = client.get("/api/v1/today").json()["items"]
+    by_id = {it["id"]: it for it in refreshed}
+    assert by_id[item_id]["template_id"] == str(final_tpl.id)
+
+
 def test_patch_explicit_status_wins_over_edit_auto_ready(
     client_factory, db: Session, free_user: User
 ) -> None:
