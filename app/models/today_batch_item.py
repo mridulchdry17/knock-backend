@@ -50,6 +50,11 @@ class TodayBatchItem(Base, TimestampMixin):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     send_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="default")
+    # Set whenever the user manually edits subject or body via PATCH. Template
+    # swaps (which re-render from a template) do NOT set this — they're a fresh
+    # render, not a manual edit. Used by POST /today/apply-template to skip
+    # cards that the user has personalized.
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Reason this card was set status='skipped' — e.g. "user_suspended",
     # "gmail_disconnected", "contact_missing_email", "reply_received". Used by
     # the admin dashboard + the followup planner to avoid spinning on items

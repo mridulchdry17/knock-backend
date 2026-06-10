@@ -97,6 +97,23 @@ class SkipTodayResultOut(BaseModel):
     skipped: Literal[True] = True
 
 
+class ApplyTemplateIn(BaseModel):
+    template_id: int
+
+
+class ApplyTemplateResultOut(BaseModel):
+    """Response for POST /today/apply-template.
+
+    `rewritten` = cards re-rendered with the new template.
+    `kept_edited` = cards left alone because the user had manually edited them.
+    `skipped_terminal` = sent/failed/skipped/cooldown cards (not editable).
+    """
+
+    rewritten: int
+    kept_edited: int
+    skipped_terminal: int
+
+
 class AdminCronRunResultItemOut(BaseModel):
     user_id: int
     items_created: int
