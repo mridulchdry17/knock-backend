@@ -12,8 +12,8 @@ inside the picker doesn't matter — any membership rejects.
 
 Send-time scheduling (UTC for v0):
   - Free tier (cap=7): 1/hour starting 6am → 6am, 7am, ..., 12pm.
-  - Paid tier (cap=20): evenly spaced across the 6am-8pm UTC window so paid
-    users still sleep. With 20 slots over 14 hours that's ~44 minutes apart.
+  - Paid tier (cap=15): evenly spaced across the 6am-8pm UTC window so paid
+    users still sleep. With 15 slots over 14 hours that's ~60 minutes apart.
     Per-user timezone is future work; v0 schedules in server UTC.
 """
 from __future__ import annotations
@@ -64,7 +64,7 @@ def compute_send_times(batch_date: date, count: int, tier: Tier) -> list[datetim
     Free: 1/hour starting 6am UTC (count<=7 keeps everything within working
     hours; if a future free cap exceeds 7 we'd wrap past noon, which is fine).
     Paid: evenly distributed across 6am-8pm UTC (~14 hours / count). With the
-    default paid cap of 20 that's ~44min per slot.
+    default paid cap of 15 that's ~60min per slot.
     super_admin: treated as paid for scheduling purposes.
     """
     if count <= 0:
