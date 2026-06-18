@@ -231,8 +231,14 @@ def _handle_bounce(
         )
         if nxt is not None:
             next_pattern, next_email = nxt
-            # Don't collide with an existing contact's address.
-            if contacts_repo.get_by_email(db, next_email) is None:
+            # Don't collide with a DIFFERENT contact's address. The lookup must
+            # exclude `contact` itself: when the next pattern happens to produce
+            # the contact's current email (e.g. it was seeded with an address
+            # that doesn't match the recorded scraped_pattern), get_by_email
+            # would otherwise match `contact` against itself and we'd wrongly
+            # bail to "patterns exhausted" with one guess left.
+            existing = contacts_repo.get_by_email(db, next_email)
+            if existing is None or existing.id == contact.id:
                 contact.email = next_email
                 contact.scraped_pattern = next_pattern
                 contact.email_verified = False
