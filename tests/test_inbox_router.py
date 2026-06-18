@@ -279,6 +279,310 @@ def test_all_category_includes_both_replies_and_bounces(
 # ─────────────────────────── sync-status ───────────────────────────
 
 
+# ─────────────────────────── GET /{id} thread detail ───────────────────────────
+
+
+def _seed_replied_with_body(
+    db: Session,
+    *,
+    user: User,
+    domain: str = "acme.com",
+    outbound_subject: str = "Quick intro about ML internship",
+    outbound_body: str = "Hi Jane,\n\nI'd love to chat.\n\nThanks,\nMridul",
+    reply_body: str | None = "Sure, send me your resume.",
+    reply_from: str | None = None,
+    explicit_stop: bool = False,
+) -> SendQueue:
+    """Like _seed_replied but with realistic outbound + inbound bodies stored
+    so the detail endpoint has something to render."""
+    company = Company(domain=domain, name=domain.split(".")[0].title(), source="test")
+    db.add(company)
+    db.flush()
+    contact = Contact(
+        company_id=company.id,
+        name="Jane Doe",
+        email=f"jane@{domain}",
+        role="Recruiter",
+    )
+    db.add(contact)
+    db.flush()
+    sq = SendQueue(
+        user_id=user.id,
+        contact_id=contact.id,
+        to_contact_id=contact.id,
+        cc_contact_ids="[]",
+        company_domain=domain,
+        subject=outbound_subject,
+        body_text=outbound_body,
+        kind="INITIAL",
+        scheduled_for=datetime.now(UTC),
+        status="REPLIED",
+        sent_at=datetime.now(UTC) - timedelta(hours=2),
+        replied_at=datetime.now(UTC) - timedelta(minutes=10),
+        reply_is_explicit_stop=explicit_stop,
+        gmail_message_id="msg-out-1",
+        gmail_thread_id="thr-detail-1",
+        rfc822_message_id="<original@mail.gmail.com>",
+        reply_body_text=reply_body,
+        reply_from_email=reply_from or (contact.email if reply_body else None),
+        reply_internal_date=(
+            datetime.now(UTC) - timedelta(minutes=10) if reply_body else None
+        ),
+    )
+    db.add(sq)
+    db.commit()
+    return sq
+
+
+def test_detail_404_when_row_belongs_to_other_user(db: Session, client_factory) -> None:
+    """Single 404 covers 'not yours' — no existence side channel."""
+    alice = _free_user(db, email="a@x.com", google_sub="g-a")
+    bob = _make_user(
+        db, email="b@x.com", google_sub="g-b", tier="free", waitlist_email="b@x.com"
+    )
+    sq = _seed_replied_with_body(db, user=bob)
+
+    r = client_factory(alice).get(f"/api/v1/inbox/{sq.id}")
+    assert r.status_code == 404
+
+
+def test_detail_404_when_id_does_not_exist(db: Session, client_factory) -> None:
+    user = _free_user(db)
+    r = client_factory(user).get("/api/v1/inbox/99999")
+    assert r.status_code == 404
+
+
+def test_detail_404_when_status_is_sent_not_in_inbox(
+    db: Session, client_factory
+) -> None:
+    """SENT-with-no-reply belongs on /today, not the inbox surface."""
+    user = _free_user(db)
+    sq = _seed_replied_with_body(db, user=user)
+    sq.status = "SENT"
+    sq.replied_at = None
+    sq.reply_body_text = None
+    db.commit()
+    r = client_factory(user).get(f"/api/v1/inbox/{sq.id}")
+    assert r.status_code == 404
+
+
+def test_detail_returns_outbound_and_inbound_for_replied_row(
+    db: Session, client_factory
+) -> None:
+    """A REPLIED row with a stored body yields the 2-message mini-thread."""
+    user = _free_user(db)
+    sq = _seed_replied_with_body(
+        db,
+        user=user,
+        outbound_subject="Hello",
+        outbound_body="First paragraph.\n\nSecond paragraph.",
+        reply_body="Thanks for reaching out.",
+    )
+    r = client_factory(user).get(f"/api/v1/inbox/{sq.id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == str(sq.id)
+    assert body["category"] == "reply"
+    assert body["subject"] == "Hello"
+    assert body["can_reply"] is True
+    assert len(body["messages"]) == 2
+
+    outbound = body["messages"][0]
+    assert outbound["direction"] == "outbound"
+    assert outbound["sender"]["email"] == user.email
+    assert outbound["body_text"] == "First paragraph.\n\nSecond paragraph."
+    # _to_html wraps blank-line-separated blocks in <p> tags.
+    assert "<p>First paragraph.</p>" in outbound["body_html"]
+    assert "<p>Second paragraph.</p>" in outbound["body_html"]
+
+    inbound = body["messages"][1]
+    assert inbound["direction"] == "inbound"
+    assert inbound["sender"]["email"] == "jane@acme.com"
+    assert inbound["sender"]["name"] == "Jane Doe"
+    assert inbound["body_text"] == "Thanks for reaching out."
+
+
+def test_detail_bounce_shows_only_outbound_and_no_reply(
+    db: Session, client_factory
+) -> None:
+    """Bounced rows can't be replied to and have no inbound to show."""
+    user = _free_user(db)
+    sq = _seed_bounced(db, user=user)
+    body = client_factory(user).get(f"/api/v1/inbox/{sq.id}").json()
+    assert body["category"] == "bounce"
+    assert body["can_reply"] is False
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["direction"] == "outbound"
+
+
+def test_detail_outbound_reply_surfaces_after_inbound(
+    db: Session, client_factory
+) -> None:
+    """After the user replies from Knock (POST /reply), the next detail render
+    must show their outbound reply as a third message."""
+    user = _free_user(db)
+    sq = _seed_replied_with_body(db, user=user)
+    sq.outbound_reply_text = "Here's my resume — link attached."
+    sq.outbound_reply_sent_at = datetime.now(UTC) - timedelta(minutes=2)
+    db.commit()
+
+    body = client_factory(user).get(f"/api/v1/inbox/{sq.id}").json()
+    assert len(body["messages"]) == 3
+    assert [m["direction"] for m in body["messages"]] == [
+        "outbound",
+        "inbound",
+        "outbound",
+    ]
+    assert body["messages"][2]["body_text"] == "Here's my resume — link attached."
+
+
+def test_detail_html_escapes_user_content(db: Session, client_factory) -> None:
+    """body_html must escape angle brackets so a body containing literal HTML
+    doesn't break rendering or open an injection vector."""
+    user = _free_user(db)
+    sq = _seed_replied_with_body(
+        db, user=user, outbound_body="<script>alert(1)</script>"
+    )
+    body = client_factory(user).get(f"/api/v1/inbox/{sq.id}").json()
+    assert "&lt;script&gt;" in body["messages"][0]["body_html"]
+    assert "<script>" not in body["messages"][0]["body_html"]
+
+
+# ─────────────────────────── POST /{id}/reply ───────────────────────────
+
+
+def test_reply_404_for_unrelated_row(db: Session, client_factory) -> None:
+    alice = _free_user(db, email="a@x.com", google_sub="g-a")
+    bob = _make_user(
+        db, email="b@x.com", google_sub="g-b", tier="free", waitlist_email="b@x.com"
+    )
+    sq = _seed_replied_with_body(db, user=bob)
+    r = client_factory(alice).post(
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+    )
+    assert r.status_code == 404
+
+
+def test_reply_409_when_row_is_bounce(db: Session, client_factory) -> None:
+    """Can't reply to a bounce — no human at the other end."""
+    user = _free_user(db)
+    sq = _seed_bounced(db, user=user)
+    r = client_factory(user).post(
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+    )
+    assert r.status_code == 409
+
+
+def test_reply_400_when_body_empty(db: Session, client_factory) -> None:
+    user = _free_user(db)
+    sq = _seed_replied_with_body(db, user=user)
+    r = client_factory(user).post(
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "   "}
+    )
+    assert r.status_code == 400
+
+
+def test_reply_happy_path_persists_outbound_text(
+    db: Session, client_factory, monkeypatch
+) -> None:
+    """Happy path: mocks gmail_send.send_followup → 200 with the new ids; the
+    sent body is denormalized on the send_queue row so the detail view shows
+    the user's own reply on the next read."""
+    from app.routers import inbox as inbox_router
+    from app.services import gmail_send
+
+    captured: dict = {}
+
+    def _fake_send_followup(creds, **kwargs):  # noqa: ANN001 — test stub
+        captured.update(kwargs)
+        return gmail_send.SendResult(
+            ok=True,
+            gmail_message_id="msg-new-1",
+            gmail_thread_id=kwargs["gmail_thread_id"],
+            rfc822_message_id="<new@mail.gmail.com>",
+        )
+
+    def _fake_creds(_user):
+        return object()  # send_followup is mocked → creds value doesn't matter
+
+    monkeypatch.setattr(inbox_router.gmail_send, "send_followup", _fake_send_followup)
+    monkeypatch.setattr(inbox_router, "get_user_credentials", _fake_creds)
+
+    user = _free_user(db)
+    sq = _seed_replied_with_body(db, user=user)
+
+    r = client_factory(user).post(
+        f"/api/v1/inbox/{sq.id}/reply",
+        json={"body_text": "Sure, here's my resume."},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["gmail_message_id"] == "msg-new-1"
+    assert body["gmail_thread_id"] == "thr-detail-1"
+
+    # Threading: must reuse the original gmail_thread_id + rfc822 message id.
+    assert captured["gmail_thread_id"] == "thr-detail-1"
+    assert captured["in_reply_to_rfc822_id"] == "<original@mail.gmail.com>"
+    # To: defaults to the address that wrote back to us.
+    assert captured["to_email"] == "jane@acme.com"
+    # Subject: Re:-prefixed (original was 'Quick intro about ML internship').
+    assert captured["subject"].lower().startswith("re:")
+
+    # Denormalized on the row for the next detail render.
+    db.refresh(sq)
+    assert sq.outbound_reply_text == "Sure, here's my resume."
+    assert sq.outbound_reply_sent_at is not None
+
+
+def test_reply_returns_401_on_gmail_auth_revoked(
+    db: Session, client_factory, monkeypatch
+) -> None:
+    """If get_user_credentials raises OAuthError, surface as 401 so the
+    frontend can show a reconnect-Gmail CTA."""
+    from app.routers import inbox as inbox_router
+    from app.services.google_oauth import OAuthError
+
+    def _fake_creds_raise(_user):
+        raise OAuthError("refresh_token missing")
+
+    monkeypatch.setattr(inbox_router, "get_user_credentials", _fake_creds_raise)
+
+    user = _free_user(db)
+    sq = _seed_replied_with_body(db, user=user)
+    r = client_factory(user).post(
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+    )
+    assert r.status_code == 401
+
+
+def test_reply_maps_quota_to_429(db: Session, client_factory, monkeypatch) -> None:
+    """gmail_send.send_followup → ok=False / quota_exceeded must surface as 429."""
+    from app.routers import inbox as inbox_router
+    from app.services import gmail_send
+
+    def _fake_send_followup(_creds, **_kwargs):
+        return gmail_send.SendResult(
+            ok=False,
+            failure_kind="quota_exceeded",
+            gmail_error_code="rateLimitExceeded",
+            error_message="Rate limit exceeded",
+        )
+
+    monkeypatch.setattr(inbox_router.gmail_send, "send_followup", _fake_send_followup)
+    monkeypatch.setattr(inbox_router, "get_user_credentials", lambda _u: object())
+
+    user = _free_user(db)
+    sq = _seed_replied_with_body(db, user=user)
+    r = client_factory(user).post(
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+    )
+    assert r.status_code == 429
+
+
+# ─────────────────────────── sync-status ───────────────────────────
+
+
 def test_sync_status_returns_healthy_true(db: Session, client_factory) -> None:
     """Frontend Zod requires a 'healthy' field — its absence was part of the
     snag. Always true in v0."""
