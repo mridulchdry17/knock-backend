@@ -8,7 +8,6 @@ shape (see `app/schemas/inbox.py`). Categories:
 """
 from __future__ import annotations
 
-import html as _html
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
@@ -19,7 +18,8 @@ from app.core.errors import ApiError
 from app.core.pagination import PaginationParams, pagination
 from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
-from app.models import Contact, SendQueue, User
+from app.models import Company, Contact, SendQueue, User
+from app.schemas.common import Ok
 from app.schemas.inbox import (
     InboxCategoryLit,
     InboxItemOut,
@@ -49,19 +49,6 @@ _STATUS_TO_CATEGORY: dict[str, InboxCategoryLit] = {
     "REPLIED": "reply",
     "BOUNCED": "bounce",
 }
-
-
-def _to_html(text: str | None) -> str:
-    """Wrap plain text into minimal HTML so the frontend's ThreadMessage view
-    can render outbound + inbound uniformly. Each blank-line-separated block
-    becomes a <p>, with single newlines preserved as <br/>. Escaped so any
-    angle brackets in the body don't break rendering."""
-    if not text:
-        return ""
-    paragraphs = [p for p in text.replace("\r\n", "\n").split("\n\n") if p.strip()]
-    return "".join(
-        "<p>" + _html.escape(p).replace("\n", "<br/>") + "</p>" for p in paragraphs
-    )
 
 
 def _snippet(body_text: str | None, *, length: int = 140) -> str:
@@ -203,7 +190,7 @@ def _load_owned_row(db, user: User, item_id: int) -> SendQueue:
     return sq
 
 
-@router.get("/{item_id}", response_model=ThreadDetailOut)
+@router.get("/{item_id}", response_model=ThreadDetailOut, response_model_by_alias=True)
 def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
     """Detail view for one inbox row — our outbound plus the latest inbound reply.
 
@@ -211,6 +198,10 @@ def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
     (the send_queue row + its denormalized reply), not the full Gmail thread.
     Bounces show only the outbound (no real recipient replied); reply rows show
     both messages when the reply body was ingested.
+
+    Response shape is locked to the frontend's `ThreadDetailSchema`:
+      { id, subject, category, sender, messages, suggested_followup }
+    `response_model_by_alias=True` so messages serialize `from_` as `from`.
     """
     sq = _load_owned_row(db, user, item_id)
 
@@ -223,20 +214,38 @@ def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
 
     category: InboxCategoryLit = _STATUS_TO_CATEGORY.get(sq.status, "reply")
 
-    # Sender for the outbound is the current user (the Knock user — that's us).
-    # `user.name` may be missing for OAuth users we never asked to name; fall
-    # back to None and let the frontend render just the email.
-    outbound_sender = ThreadParticipantOut(
-        name=getattr(user, "name", None) or None,
+    # `sender` on the thread is the RECRUITER — the contact we addressed. The
+    # frontend renders this in the thread header (name • role • company).
+    # Hydrate contact + company together; both can be missing on legacy/test rows.
+    to_contact: Contact | None = (
+        db.get(Contact, sq.to_contact_id) if sq.to_contact_id is not None else None
+    )
+    company: Company | None = (
+        db.get(Company, to_contact.company_id)
+        if to_contact is not None and to_contact.company_id is not None
+        else None
+    )
+
+    thread_sender = ThreadParticipantOut(
+        name=(to_contact.name if to_contact else None),
+        email=(to_contact.email if to_contact and to_contact.email else (sq.reply_from_email or "")),
+        role=(to_contact.role if to_contact else None),
+        company=(company.name if company else None),
+    )
+
+    # `from` on each message is the AUTHOR. Outbound = the Knock user; inbound =
+    # whoever wrote back to us (reply_from_email, with the contact's name when
+    # the from_email matches that contact).
+    me = InboxSenderOut(
+        name=getattr(user, "full_name", None) or None,
         email=user.email,
     )
 
     outbound = ThreadMessageOut(
+        id=f"sq-{sq.id}-out",
         direction="outbound",
-        sender=outbound_sender,
-        subject=sq.subject or "",
-        body_text=sq.body_text or "",
-        body_html=_to_html(sq.body_text),
+        from_=me,
+        body_html=sq.body_text or "",
         sent_at=ensure_utc(sq.sent_at or sq.created_at),
     )
 
@@ -245,37 +254,32 @@ def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
     # Inbound — present only when the reply ingestor stored a body for this row.
     # Bounce rows never get a reply_body_text (the ingestor's bounce path takes
     # a different branch), so this naturally yields a single-message thread for
-    # them. The to_contact lookup gives us a name for the inbound when the
-    # reply came from the same contact we addressed.
+    # them.
     if sq.reply_body_text:
         inbound_email = sq.reply_from_email or ""
         inbound_name: str | None = None
-        if sq.to_contact_id is not None:
-            contact = db.get(Contact, sq.to_contact_id)
-            if contact is not None:
-                # Only attach the contact's name when the reply actually came
-                # from that contact's address — otherwise the reply is from
-                # someone else on the thread and we don't know their name.
-                if contact.email and inbound_email and (
-                    contact.email.lower() == inbound_email.lower()
-                ):
-                    inbound_name = contact.name
-                # Fallback: no from_email persisted (legacy rows) — assume the
-                # contact we addressed is who replied.
-                if not inbound_email and contact.email:
-                    inbound_email = contact.email
-                    inbound_name = contact.name
+        if to_contact is not None:
+            # Only attach the contact's name when the reply actually came from
+            # that contact's address — otherwise the reply is from a colleague
+            # on the thread and we don't know their name.
+            if to_contact.email and inbound_email and (
+                to_contact.email.lower() == inbound_email.lower()
+            ):
+                inbound_name = to_contact.name
+            # Fallback for legacy rows that didn't persist from_email.
+            if not inbound_email and to_contact.email:
+                inbound_email = to_contact.email
+                inbound_name = to_contact.name
 
         inbound_ts = ensure_utc(
             sq.reply_internal_date or sq.replied_at or sq.sent_at or sq.created_at
         )
         messages.append(
             ThreadMessageOut(
+                id=f"sq-{sq.id}-in",
                 direction="inbound",
-                sender=ThreadParticipantOut(name=inbound_name, email=inbound_email),
-                subject=sq.subject or "",  # threading subject; same as outbound's
-                body_text=sq.reply_body_text,
-                body_html=_to_html(sq.reply_body_text),
+                from_=InboxSenderOut(name=inbound_name, email=inbound_email),
+                body_html=sq.reply_body_text,
                 sent_at=inbound_ts,
             )
         )
@@ -287,33 +291,23 @@ def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
     if sq.outbound_reply_text:
         messages.append(
             ThreadMessageOut(
+                id=f"sq-{sq.id}-out-reply",
                 direction="outbound",
-                sender=outbound_sender,
-                subject=sq.subject or "",
-                body_text=sq.outbound_reply_text,
-                body_html=_to_html(sq.outbound_reply_text),
+                from_=me,
+                body_html=sq.outbound_reply_text,
                 sent_at=ensure_utc(
                     sq.outbound_reply_sent_at or sq.replied_at or sq.created_at
                 ),
             )
         )
 
-    # Replying needs a Gmail thread to land on + (ideally) an RFC822 Message-ID
-    # for the In-Reply-To header. Bounces can't be replied to (no human at the
-    # other end). Legacy rows without a thread id can't thread reliably either.
-    can_reply = (
-        sq.status == "REPLIED"
-        and sq.gmail_thread_id is not None
-        and bool(sq.reply_body_text)
-    )
-
     return ThreadDetailOut(
         id=str(sq.id),
-        category=category,
         subject=sq.subject or "",
-        company_domain=sq.company_domain,
-        can_reply=can_reply,
+        category=category,
+        sender=thread_sender,
         messages=messages,
+        suggested_followup=None,  # reserved — feature not built yet
     )
 
 
@@ -383,8 +377,12 @@ def post_reply(
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    body_text = (payload.body_text or "").strip()
-    if not body_text:
+    # Pass-through: backend stores whatever the composer sent (Tiptap's HTML by
+    # default). Emptiness is a frontend concern (Tiptap emits `<p></p>` for an
+    # empty editor — the composer guards against that before POSTing); here we
+    # only reject a literally empty/whitespace-only payload.
+    body_html = (payload.body_html or "").strip()
+    if not body_html:
         raise ApiError(
             "invalid_input",
             "Reply body is required.",
@@ -419,7 +417,10 @@ def post_reply(
         to_email=to_email,
         cc_emails=[],  # v0: no CC on user-initiated replies
         subject=subject,
-        body_text=body_text,
+        # build_mime flattens HTML → plain text via html_to_text; the wire is
+        # still text/plain. We pass the HTML so authored formatting survives
+        # at least visually (paragraph breaks etc.) when flattened.
+        body_text=body_html,
         gmail_thread_id=sq.gmail_thread_id,
         # Best-effort In-Reply-To header. We persist rfc822_message_id at send
         # time, but it may be missing for older rows; Gmail's threadId alone
@@ -457,9 +458,11 @@ def post_reply(
         )
 
     # Persist on the send_queue row so the next detail render surfaces this
-    # send without a Gmail roundtrip. v0 only stores the last outbound reply
-    # (overwrites prior).
-    sq.outbound_reply_text = body_text
+    # send without a Gmail roundtrip. The column is named *_text for legacy
+    # reasons (added before Tiptap shipped) — it stores Tiptap's HTML now;
+    # GET /inbox/{id} passes it through to body_html directly (no _to_html
+    # wrap, which would double-escape).
+    sq.outbound_reply_text = body_html
     sq.outbound_reply_sent_at = utcnow()
     db.add(sq)
     db.commit()
@@ -471,8 +474,35 @@ def post_reply(
         gmail_thread_id=result.gmail_thread_id,
     )
 
+    # message_id (not gmail_message_id) matches the frontend's ReplyResultSchema
+    # — empty-string fallback because the schema requires a string, and a
+    # successful Gmail send always returns one.
     return ReplyResultOut(
         ok=True,
-        gmail_message_id=result.gmail_message_id,
-        gmail_thread_id=result.gmail_thread_id,
+        message_id=result.gmail_message_id or "",
     )
+
+
+# Stubs for state tracking the frontend's inbox page calls but that have no
+# v0 backend storage. Returning 200 keeps the page from snagging on the
+# fire-and-forget read mark and the user-initiated done click. Persistence
+# (an `inbox_state` row per (user, send_queue_id)) is a future migration.
+
+
+@router.post("/{item_id}/read", response_model=Ok)
+def post_mark_read(item_id: int, user: CurrentUser, db: DbDep) -> Ok:
+    """No-op marker that the row has been read. v0 has no `read_at` column;
+    the frontend calls this fire-and-forget on first load, so we just confirm
+    ownership (404 otherwise) and return ok=True."""
+    _load_owned_row(db, user, item_id)
+    return Ok()
+
+
+@router.post("/{item_id}/done", response_model=Ok)
+def post_mark_done(item_id: int, user: CurrentUser, db: DbDep) -> Ok:
+    """No-op marker that the user is done with the row. v0 has no `done_at`
+    column; the UI removes the card optimistically on a 200, so we just
+    confirm ownership and return ok=True. Real persistence is a future
+    migration once inbox-zero state lands."""
+    _load_owned_row(db, user, item_id)
+    return Ok()
