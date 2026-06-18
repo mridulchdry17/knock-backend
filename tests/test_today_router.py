@@ -194,6 +194,77 @@ def test_patch_subject_auto_marks_ready(
     assert out["status"] == "ready"
 
 
+def test_patch_late_approval_restamps_send_time(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Editing/approving a card with a past send_time must re-stamp it to the
+    back of the schedule, NOT leave it immediately-due (which would blast on
+    the next drain tick)."""
+    from datetime import timedelta
+
+    from app.core.time import ensure_utc
+    from app.repositories import today_batch as today_repo
+
+    _seed_pool(db, n=1)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    # Force this card's send_time well into the past.
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    item = items[0]
+    now = utcnow()
+    item.send_time = now - timedelta(hours=4)
+    db.add(item)
+    db.commit()
+
+    client = client_factory(free_user)
+    # Edit (not setting send_time explicitly) → status auto-flips to 'ready' →
+    # late-stamp helper must re-stamp the past send_time forward.
+    r = client.patch(
+        f"/api/v1/today/items/{item.id}",
+        json={"subject": "Edited subject"},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["status"] == "ready"
+
+    db.expire_all()
+    fresh = today_repo.list_for_user_date(db, free_user.id, utcnow().date())[0]
+    assert ensure_utc(fresh.send_time) > now, fresh.send_time
+
+
+def test_patch_explicit_send_time_skips_late_restamp(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """If the caller sets send_time explicitly in the PATCH, we honor it
+    verbatim — no surprise re-stamping."""
+    from datetime import timedelta
+
+    from app.core.time import ensure_utc
+    from app.repositories import today_batch as today_repo
+
+    _seed_pool(db, n=1)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    item = items[0]
+    # User explicitly chooses a past send_time (unusual but allowed — perhaps
+    # to test the drain or to backfill an audit row). We must NOT re-stamp.
+    chosen = utcnow() - timedelta(hours=2)
+    client = client_factory(free_user)
+    r = client.patch(
+        f"/api/v1/today/items/{item.id}",
+        json={"send_time": chosen.isoformat(), "status": "ready"},
+    )
+    assert r.status_code == 200
+
+    db.expire_all()
+    fresh = today_repo.list_for_user_date(db, free_user.id, utcnow().date())[0]
+    # Within a few seconds (datetime serialization round-trip rounding).
+    assert abs((ensure_utc(fresh.send_time) - chosen).total_seconds()) < 2
+
+
 def test_patch_status_skipped_works(
     client_factory, db: Session, free_user: User
 ) -> None:
@@ -519,35 +590,93 @@ def _stub_send_ok():
     return stack
 
 
-def test_send_batch_dispatches_non_skipped_items(
+def test_send_batch_does_not_blast_late_items(
     client_factory, db: Session, free_user: User
 ) -> None:
+    """The bug: clicking 'Send today's batch' used to blast every approved card
+    immediately. Now late items (send_time < now) must be re-stamped to the back
+    of the schedule at the tier's cadence — none should dispatch in this call.
+    """
+    from datetime import timedelta
+
+    from app.repositories import today_batch as today_repo
+
     _seed_pool(db, n=3)
     batch_gen_svc.generate_batch_for_user(
         db, free_user, batch_date=utcnow().date(), rng=Random(1)
     )
-    client = client_factory(free_user)
+    # Force all three send_times into the past so they're all "late".
+    now = utcnow()
+    items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    for i, item in enumerate(items):
+        item.send_time = now - timedelta(hours=3 + i)
+        db.add(item)
+    db.commit()
 
+    client = client_factory(free_user)
     with _stub_send_ok():
         r = client.post("/api/v1/today/send-batch")
 
     assert r.status_code == 200
     body = r.json()
-    assert set(body.keys()) >= {
-        "dispatched_count",
-        "scheduled_first_at",
-        "scheduled_last_at",
-    }
-    assert body["dispatched_count"] == 3
+    assert body["dispatched_count"] == 3  # 3 approved (queued), not blasted
 
-    # All three cards transitioned to 'sent'.
-    from app.repositories import today_batch as today_repo
+    # NOTHING was dispatched immediately — all 3 are queued (status='ready')
+    # with FUTURE send_times spaced ~1 hour apart (free cadence).
+    from app.core.time import ensure_utc
 
     db.expire_all()
     items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
-    assert sorted(i.status for i in items) == ["sent", "sent", "sent"]
-    # sent_today bumped.
-    assert db.get(User, free_user.id).sent_today == 3
+    assert all(i.status == "ready" for i in items), [i.status for i in items]
+    assert all(ensure_utc(i.send_time) > now for i in items), [
+        (i.id, i.send_time) for i in items
+    ]
+    # sent_today unchanged — nothing actually sent in this call.
+    assert db.get(User, free_user.id).sent_today == 0
+
+
+def test_send_batch_keeps_future_slots_intact_restamps_only_late(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Future-dated cards keep their original slot; only the late ones move."""
+    from datetime import timedelta
+
+    from app.repositories import today_batch as today_repo
+
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    now = utcnow()
+    items = sorted(
+        today_repo.list_for_user_date(db, free_user.id, utcnow().date()),
+        key=lambda x: x.id,
+    )
+    items[0].send_time = now - timedelta(hours=2)  # late
+    items[1].send_time = now + timedelta(hours=1)  # future
+    items[2].send_time = now + timedelta(hours=3)  # future (latest)
+    for it in items:
+        db.add(it)
+    db.commit()
+    original_future = (items[1].send_time, items[2].send_time)
+
+    client = client_factory(free_user)
+    with _stub_send_ok():
+        r = client.post("/api/v1/today/send-batch")
+    assert r.status_code == 200
+
+    db.expire_all()
+    items = sorted(
+        today_repo.list_for_user_date(db, free_user.id, utcnow().date()),
+        key=lambda x: x.id,
+    )
+    from app.core.time import ensure_utc
+
+    # Future slots untouched.
+    assert ensure_utc(items[1].send_time) == ensure_utc(original_future[0])
+    assert ensure_utc(items[2].send_time) == ensure_utc(original_future[1])
+    # Late item moved to AFTER the latest future slot (cadence past +3h).
+    assert ensure_utc(items[0].send_time) > ensure_utc(items[2].send_time)
 
 
 def test_send_batch_leaves_skipped_items_untouched(
@@ -569,12 +698,15 @@ def test_send_batch_leaves_skipped_items_untouched(
         r = client.post("/api/v1/today/send-batch")
 
     assert r.status_code == 200
-    assert r.json()["dispatched_count"] == 2
+    assert r.json()["dispatched_count"] == 2  # 2 approved (skipped one excluded)
 
     db.expire_all()
     items = today_repo.list_for_user_date(db, free_user.id, utcnow().date())
     statuses = sorted(i.status for i in items)
-    assert statuses == ["sent", "sent", "skipped"]
+    # Skipped stays skipped; the other two are queued (ready) or sent depending
+    # on whether their slot is currently due.
+    assert "skipped" in statuses
+    assert "default" not in statuses
 
 
 def test_send_batch_is_idempotent(
@@ -588,11 +720,27 @@ def test_send_batch_is_idempotent(
 
     with _stub_send_ok():
         first = client.post("/api/v1/today/send-batch")
-        second = client.post("/api/v1/today/send-batch")
+        # Snapshot state after first call.
+        from app.repositories import today_batch as today_repo
 
-    assert first.json()["dispatched_count"] == 2
-    # Everything already sent → nothing to dispatch on the second call.
-    assert second.json()["dispatched_count"] == 0
+        db.expire_all()
+        after_first = sorted(
+            (i.status, i.send_time)
+            for i in today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+        )
+        # Second call: discarded result — we only care that state didn't change.
+        client.post("/api/v1/today/send-batch")
+
+    assert first.json()["dispatched_count"] == 2  # 2 approved on first call
+    # Second call: items are already 'ready' (not 'default'), so no promotion
+    # happens but they're still counted as sendable in dispatched_count if
+    # status='ready'. The key invariant: send_times don't move and no double-send.
+    db.expire_all()
+    after_second = sorted(
+        (i.status, i.send_time)
+        for i in today_repo.list_for_user_date(db, free_user.id, utcnow().date())
+    )
+    assert after_first == after_second  # no double-restamp, no double-send
 
 
 def test_send_batch_with_no_batch_dispatches_zero(

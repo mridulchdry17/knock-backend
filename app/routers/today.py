@@ -31,7 +31,7 @@ from app.schemas.today import (
     UpdateItemIn,
 )
 from app.services import batch_generator as batch_gen_svc
-from app.services import send_caps, send_worker
+from app.services import send_caps, send_scheduling, send_worker
 from app.services import templates as templates_svc
 
 router = APIRouter(
@@ -347,6 +347,21 @@ def update_today_item(
     db.add(item)
     db.commit()
     db.refresh(item)
+
+    # If this card just transitioned to 'ready' AFTER its scheduled slot
+    # passed (user approving late in the day), re-stamp it to the back of the
+    # queue so it doesn't blast on the next drain tick. Future-dated items are
+    # left alone. Skipped if the caller set send_time explicitly in this PATCH.
+    now = utcnow()
+    if (
+        item.status == "ready"
+        and payload.send_time is None
+        and ensure_utc(item.send_time) < now
+    ):
+        send_scheduling.stamp_late_items_for_user(db, user, [item], now=now)
+        db.commit()
+        db.refresh(item)
+
     log.info(
         "today.item_updated",
         user_id=user.id,
@@ -360,18 +375,21 @@ def update_today_item(
 
 @router.post("/send-batch", response_model=SendBatchResultOut)
 def send_batch(user: CurrentUser, db: DbDep) -> SendBatchResultOut:
-    """Manual "Send today's batch" — the skip-then-send model.
+    """Manual "Approve today's batch" — staggered, NOT immediate.
 
-    Every non-skipped card in today's batch is sendable. We promote any
-    'default' card to 'ready' (the user reviewing the page and hitting Send
-    IS the approval — there's no separate mark-ready step) and then drain
-    this user's ready items immediately, ignoring the staggered send_time
-    slots. Autopilot keeps the staggered schedule; manual = send now.
+    Promotes every non-skipped/non-sent card to 'ready' (clicking Send IS the
+    approval), then RE-STAMPS any card whose send_time has already passed to
+    the back of the user's schedule at the tier's cadence. The scheduler
+    drains items as their (now-future) send_times arrive — manual and autopilot
+    share the same staggered cadence.
 
-    'skipped' / 'sent' / 'failed' cards are left untouched. Idempotent: a
-    second call after everything's sent dispatches zero.
+    Items already due (send_time <= now) get dispatched immediately in this
+    call; everything else waits for its slot. 'skipped' / 'sent' / 'failed'
+    cards are left untouched. Idempotent: re-calling after everything's queued
+    re-stamps nothing new and dispatches only what's currently due.
     """
     today = utcnow().date()
+    now = utcnow()
     items = today_repo.list_for_user_date(db, user.id, today)
 
     sendable = [i for i in items if i.status in ("default", "ready")]
@@ -381,27 +399,37 @@ def send_batch(user: CurrentUser, db: DbDep) -> SendBatchResultOut:
             db.add(item)
     db.commit()
 
-    summary = send_worker.drain_due_items(
-        db, user_id=user.id, ignore_schedule=True
-    )
+    # Re-stamp late items so they queue at the back of the schedule instead of
+    # all becoming immediately-due. Future-dated items keep their slot.
+    late, _future = send_scheduling.partition_late(sendable, now=now)
+    if late:
+        send_scheduling.stamp_late_items_for_user(db, user, late, now=now)
+        db.commit()
+        # refresh local handles since we just mutated send_time
+        for item in late:
+            db.refresh(item)
+
+    # Drain anything currently due (NO ignore_schedule — honors send_time).
+    summary = send_worker.drain_due_items(db, user_id=user.id)
 
     log.info(
         "today.send_batch",
         user_id=user.id,
-        sendable=len(sendable),
-        dispatched=summary.sent,
+        approved=len(sendable),
+        late_restamped=len(late),
+        dispatched_now=summary.sent,
         failed=summary.failed,
         skipped=summary.skipped,
     )
 
-    # The frontend shows "Sending N — first at HH:MM, last at HH:MM". For the
-    # manual path everything goes out now, so first/last collapse to ~now; we
-    # still report the planned slots' span when present for an honest window.
-    times = [i.send_time for i in sendable] or [utcnow()]
+    # Time span across the cards the user just approved — first send is the
+    # earliest among them (possibly now if any were already due), last is the
+    # latest after re-stamping. Honest window for the frontend toast.
+    times = [ensure_utc(i.send_time) for i in sendable] or [now]
     return SendBatchResultOut(
-        dispatched_count=summary.sent,
-        scheduled_first_at=ensure_utc(min(times)),
-        scheduled_last_at=ensure_utc(max(times)),
+        dispatched_count=len(sendable),
+        scheduled_first_at=min(times),
+        scheduled_last_at=max(times),
     )
 
 

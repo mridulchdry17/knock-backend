@@ -206,25 +206,27 @@ def drain_due_items(
     *,
     now: datetime | None = None,
     user_id: int | None = None,
-    ignore_schedule: bool = False,
 ) -> DrainSummary:
-    """Process 'ready' today_batch_items and send them.
+    """Process 'ready' today_batch_items whose send_time is due.
 
-    Defaults (scheduler/autopilot path): every user's 'ready' item whose
-    send_time <= now. `user_id` scopes to one user; `ignore_schedule=True`
-    drops the send_time gate (the manual "Send today's batch" path, where the
-    user explicitly chose to send now regardless of the staggered slot).
+    Always honors `send_time <= now` — every dispatch is staggered per the
+    picker's schedule. `user_id` scopes to one user (manual review path);
+    omit for the scheduler/autopilot drain. Manual approval must NEVER bypass
+    the schedule — late items get re-stamped to the back of the queue via
+    `send_scheduling.stamp_late_items_for_user` instead.
     """
     now = now or utcnow()
     summary = DrainSummary()
 
     # Read the due-set in one query, oldest first. We don't hold a transaction
     # across the iteration — each item runs in its own commit boundary.
-    query = select(TodayBatchItem).where(TodayBatchItem.status == "ready")
+    query = (
+        select(TodayBatchItem)
+        .where(TodayBatchItem.status == "ready")
+        .where(TodayBatchItem.send_time <= now)
+    )
     if user_id is not None:
         query = query.where(TodayBatchItem.user_id == user_id)
-    if not ignore_schedule:
-        query = query.where(TodayBatchItem.send_time <= now)
     due = list(db.scalars(query.order_by(TodayBatchItem.send_time.asc())).all())
 
     for item in due:
