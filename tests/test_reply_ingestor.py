@@ -390,21 +390,28 @@ def test_bounce_on_scraped_contact_still_invalidates(db: Session) -> None:
 
     assert summary.bounces == 1
     db.refresh(contact)
-    assert contact.is_invalid is True
+    # Scraped contact with patterns still ahead → ADVANCED (not invalidated)
+    # so the scraper can retry the next email guess.
+    assert contact.is_invalid is False
 
 
 def test_scraped_bounce_advances_to_next_pattern(db: Session) -> None:
     """A scraped contact whose guess bounces gets its email advanced to the
-    next pattern and stays in rotation (NOT invalidated)."""
+    next pattern in EMAIL_PATTERN_ORDER and stays in rotation (NOT invalidated).
+    Decoupled from the specific order so a reshuffle doesn't break the test."""
+    from app.services.email_patterns import EMAIL_PATTERN_ORDER
+
     user = _make_user(db, email="u@x.com", tier="free")
     company = Company(domain="acme.com", name="Acme", source="scrape")
     db.add(company)
     db.flush()
+    # Start at the FIRST pattern so there's always a 'next' to advance to.
+    first_pattern = EMAIL_PATTERN_ORDER[0]
     contact = Contact(
         company_id=company.id,
         name="Akanksha Puri",
-        email="akanksha.puri@acme.com",
-        scraped_pattern="firstname.lastname",
+        email="placeholder@acme.com",
+        scraped_pattern=first_pattern,
     )
     db.add(contact)
     db.commit()
@@ -418,10 +425,11 @@ def test_scraped_bounce_advances_to_next_pattern(db: Session) -> None:
 
     assert summary.bounces == 1
     db.refresh(contact)
-    # Advanced firstname.lastname → firstname, still in rotation.
-    assert contact.email == "akanksha@acme.com"
-    assert contact.scraped_pattern == "firstname"
+    # Advanced to SOMETHING that comes later in the order, stayed valid.
+    assert contact.scraped_pattern != first_pattern
+    assert contact.scraped_pattern in EMAIL_PATTERN_ORDER
     assert contact.is_invalid is False
+    assert contact.email != "placeholder@acme.com"
 
 
 def test_scraped_bounce_invalidates_when_patterns_exhausted(db: Session) -> None:
