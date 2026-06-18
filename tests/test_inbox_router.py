@@ -129,7 +129,13 @@ def test_empty_returns_200_not_404(db: Session, client_factory) -> None:
     assert body["total"] == 0
 
 
-def test_lists_user_replies_newest_first(db: Session, client_factory) -> None:
+def test_lists_user_replies_newest_first_with_new_shape(
+    db: Session, client_factory
+) -> None:
+    """List response matches the F.7 frontend Zod contract: id is a string,
+    sender is an object, category='reply', ordered newest-first. The previous
+    shape (company_domain / lock_status / reply_is_explicit_stop) was nowhere
+    in the frontend Zod and caused the 'snag' on every tab."""
     user = _free_user(db)
     _seed_replied(db, user=user, domain="acme.com", company_name="Acme", replied_minutes_ago=30)
     _seed_replied(db, user=user, domain="beta.io", company_name="Beta", replied_minutes_ago=5)
@@ -139,59 +145,38 @@ def test_lists_user_replies_newest_first(db: Session, client_factory) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["total"] == 2
-    domains = [i["company_domain"] for i in body["items"]]
-    assert domains == ["beta.io", "acme.com"]  # newest first
+    assert body["unread_count"] == 0
+
+    # Shape — exactly what the frontend Zod expects, no extras it doesn't know.
+    items = body["items"]
+    expected_keys = {
+        "id",
+        "category",
+        "subject",
+        "sender",
+        "snippet",
+        "last_message_at",
+        "unread",
+        "message_count",
+    }
+    assert set(items[0].keys()) >= expected_keys
+    assert isinstance(items[0]["id"], str)
+    assert items[0]["category"] == "reply"
+    assert set(items[0]["sender"].keys()) == {"name", "email"}
+    # Newest first — beta first since replied 5 min ago vs acme 30 min ago.
+    emails = [i["sender"]["email"] for i in items]
+    assert emails == ["john@beta.io", "john@acme.com"]
 
 
-def test_explicit_stop_field_surfaces_platform_permanent_status(
-    db: Session, client_factory
-) -> None:
+def test_snippet_is_truncated_to_140_chars(db: Session, client_factory) -> None:
+    """Snippet is a single-line preview capped at 140 chars."""
     user = _free_user(db)
-    # Simulating the post-ingest world: send_queue row + platform_company_lock row.
-    _seed_replied(db, user=user, explicit_stop=True)
-    from app.models import PlatformCompanyLock
-
-    db.add(
-        PlatformCompanyLock(
-            company_domain="acme.com",
-            reason="explicit_stop_reply",
-            created_at=datetime.now(UTC),
-        )
-    )
+    sq = _seed_replied(db, user=user)
+    sq.body_text = "x" * 300
     db.commit()
-
-    client = client_factory(user)
-    r = client.get("/api/v1/inbox")
-    item = r.json()["items"][0]
-    assert item["reply_is_explicit_stop"] is True
-    assert item["lock_status"] == "platform_permanent"
-    assert item["locked_until"] is None
-
-
-def test_regular_reply_surfaces_user_reply_lock_status(
-    db: Session, client_factory
-) -> None:
-    user = _free_user(db)
-    _seed_replied(db, user=user, explicit_stop=False)
-    # Per-user lock — what record_reply_from_company writes.
-    from app.models import UserCompanyLock
-
-    db.add(
-        UserCompanyLock(
-            user_id=user.id,
-            company_domain="acme.com",
-            locked_at=datetime.now(UTC),
-            locked_until=datetime.now(UTC) + timedelta(days=30),
-            is_permanent=False,
-            reason="reply",
-        )
-    )
-    db.commit()
-
     client = client_factory(user)
     item = client.get("/api/v1/inbox").json()["items"][0]
-    assert item["lock_status"] == "user_reply_lock"
-    assert item["locked_until"] is not None
+    assert len(item["snippet"]) <= 141  # 140 chars + ellipsis fits
 
 
 def test_user_isolation(db: Session, client_factory) -> None:
@@ -206,3 +191,98 @@ def test_user_isolation(db: Session, client_factory) -> None:
     body = client.get("/api/v1/inbox").json()
     assert body["items"] == []
     assert body["total"] == 0
+
+
+# ─────────────────────────── ?category= filter ───────────────────────────
+
+
+def _seed_bounced(
+    db: Session, *, user: User, domain: str = "dead.com", minutes_ago: int = 10
+) -> SendQueue:
+    """Seed a BOUNCED send_queue row (the reply ingestor's bounce path)."""
+    company = Company(domain=domain, name=domain, source="test")
+    db.add(company)
+    db.flush()
+    contact = Contact(company_id=company.id, name=None, email=f"missing@{domain}")
+    db.add(contact)
+    db.flush()
+    sq = SendQueue(
+        user_id=user.id,
+        contact_id=contact.id,
+        to_contact_id=contact.id,
+        cc_contact_ids="[]",
+        company_domain=domain,
+        subject="Re: Quick intro",
+        body_text="Delivery failed.",
+        kind="INITIAL",
+        scheduled_for=datetime.now(UTC),
+        status="BOUNCED",
+        sent_at=datetime.now(UTC) - timedelta(minutes=minutes_ago),
+        gmail_message_id="msg-out-b",
+        gmail_thread_id="thr-b",
+    )
+    db.add(sq)
+    db.commit()
+    return sq
+
+
+def test_category_reply_filters_to_replied_only(db: Session, client_factory) -> None:
+    user = _free_user(db)
+    _seed_replied(db, user=user, domain="acme.com")
+    _seed_bounced(db, user=user, domain="dead.com")
+
+    body = client_factory(user).get("/api/v1/inbox?category=reply").json()
+    assert body["total"] == 1
+    assert {i["category"] for i in body["items"]} == {"reply"}
+
+
+def test_category_bounce_filters_to_bounced_only(db: Session, client_factory) -> None:
+    """Section 3 (Bounces tab) — was snagging before; now returns BOUNCED rows."""
+    user = _free_user(db)
+    _seed_replied(db, user=user, domain="acme.com")
+    _seed_bounced(db, user=user, domain="dead.com")
+
+    body = client_factory(user).get("/api/v1/inbox?category=bounce").json()
+    assert body["total"] == 1
+    assert {i["category"] for i in body["items"]} == {"bounce"}
+
+
+def test_category_nudge_returns_empty_200(db: Session, client_factory) -> None:
+    """Nudge category isn't implemented yet — must return empty 200, not snag."""
+    user = _free_user(db)
+    _seed_replied(db, user=user)
+
+    r = client_factory(user).get("/api/v1/inbox?category=nudge")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["items"] == []
+    assert body["total"] == 0
+    assert body["unread_count"] == 0
+
+
+def test_all_category_includes_both_replies_and_bounces(
+    db: Session, client_factory
+) -> None:
+    """Omitting the category param (All tab) returns replies + bounces."""
+    user = _free_user(db)
+    _seed_replied(db, user=user, domain="acme.com", replied_minutes_ago=30)
+    _seed_bounced(db, user=user, domain="dead.com", minutes_ago=5)
+
+    body = client_factory(user).get("/api/v1/inbox").json()
+    assert body["total"] == 2
+    cats = [i["category"] for i in body["items"]]
+    assert sorted(cats) == ["bounce", "reply"]
+    # Newest first — the bounce was 5 min ago vs reply 30 min ago.
+    assert body["items"][0]["category"] == "bounce"
+
+
+# ─────────────────────────── sync-status ───────────────────────────
+
+
+def test_sync_status_returns_healthy_true(db: Session, client_factory) -> None:
+    """Frontend Zod requires a 'healthy' field — its absence was part of the
+    snag. Always true in v0."""
+    user = _free_user(db)
+    body = client_factory(user).get("/api/v1/inbox/sync-status").json()
+    assert body["healthy"] is True
+    assert "last_synced_at" in body

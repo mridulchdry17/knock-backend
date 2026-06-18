@@ -23,16 +23,16 @@ def test_build_each_pattern(pattern: str, expected: str) -> None:
 
 
 def test_next_guess_walks_the_order() -> None:
-    # firstname.lastname bounced → firstname is next.
-    assert ep.next_guess("Akanksha Puri", "sourcefuse.com", "firstname.lastname") == (
-        "firstname",
-        "akanksha@sourcefuse.com",
-    )
-    # firstname bounced → f.lastname next.
-    assert ep.next_guess("Akanksha Puri", "sourcefuse.com", "firstname") == (
-        "f.lastname",
-        "a.puri@sourcefuse.com",
-    )
+    # Walks forward through EMAIL_PATTERN_ORDER. Decoupled from the specific
+    # order so a reshuffle (firstname-first vs firstname.lastname-first) doesn't
+    # break this test — we only assert "advances to the next entry."
+    order = ep.EMAIL_PATTERN_ORDER
+    for i, current in enumerate(order[:-1]):
+        nxt = ep.next_guess("Akanksha Puri", "sourcefuse.com", current)
+        assert nxt is not None, f"expected a next guess after {current!r}"
+        assert nxt[0] == order[i + 1], (
+            f"after {current!r} expected {order[i+1]!r}, got {nxt[0]!r}"
+        )
 
 
 def test_next_guess_none_when_exhausted() -> None:
@@ -47,10 +47,10 @@ def test_single_word_name_skips_lastname_patterns() -> None:
 
 
 def test_unknown_current_pattern_starts_from_top() -> None:
-    assert ep.next_guess("Akanksha Puri", "sourcefuse.com", "garbage") == (
-        "firstname.lastname",
-        "akanksha.puri@sourcefuse.com",
-    )
+    # An unknown/typo'd current pattern resets to whatever's first in the order.
+    nxt = ep.next_guess("Akanksha Puri", "sourcefuse.com", "garbage")
+    assert nxt is not None
+    assert nxt[0] == ep.EMAIL_PATTERN_ORDER[0]
 
 
 def test_titles_and_punctuation_cleaned() -> None:
