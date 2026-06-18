@@ -369,7 +369,10 @@ def test_detail_404_when_status_is_sent_not_in_inbox(
 def test_detail_returns_outbound_and_inbound_for_replied_row(
     db: Session, client_factory
 ) -> None:
-    """A REPLIED row with a stored body yields the 2-message mini-thread."""
+    """A REPLIED row with a stored body yields the 2-message mini-thread.
+    Shape matches frontend's ThreadDetailSchema exactly — `sender` on the
+    detail is the recruiter (ThreadParticipant), each message has `id` +
+    `from`, body content lives in `body_html` (pass-through, no conversion)."""
     user = _free_user(db)
     sq = _seed_replied_with_body(
         db,
@@ -384,33 +387,38 @@ def test_detail_returns_outbound_and_inbound_for_replied_row(
     assert body["id"] == str(sq.id)
     assert body["category"] == "reply"
     assert body["subject"] == "Hello"
-    assert body["can_reply"] is True
+    # Recruiter side on detail.sender — name, email, role, company per Zod.
+    assert body["sender"]["email"] == "jane@acme.com"
+    assert body["sender"]["name"] == "Jane Doe"
+    assert body["sender"]["role"] == "Recruiter"
+    assert body["sender"]["company"] == "Acme"
+    assert body["suggested_followup"] is None
     assert len(body["messages"]) == 2
 
     outbound = body["messages"][0]
     assert outbound["direction"] == "outbound"
-    assert outbound["sender"]["email"] == user.email
-    assert outbound["body_text"] == "First paragraph.\n\nSecond paragraph."
-    # _to_html wraps blank-line-separated blocks in <p> tags.
-    assert "<p>First paragraph.</p>" in outbound["body_html"]
-    assert "<p>Second paragraph.</p>" in outbound["body_html"]
+    assert isinstance(outbound["id"], str) and outbound["id"]
+    assert outbound["from"]["email"] == user.email
+    # Pass-through — backend stores plain text in send_queue.body_text and
+    # surfaces it under the frontend's `body_html` field name without any
+    # conversion. Frontend owns rendering.
+    assert outbound["body_html"] == "First paragraph.\n\nSecond paragraph."
 
     inbound = body["messages"][1]
     assert inbound["direction"] == "inbound"
-    assert inbound["sender"]["email"] == "jane@acme.com"
-    assert inbound["sender"]["name"] == "Jane Doe"
-    assert inbound["body_text"] == "Thanks for reaching out."
+    assert inbound["from"]["email"] == "jane@acme.com"
+    assert inbound["from"]["name"] == "Jane Doe"
+    assert inbound["body_html"] == "Thanks for reaching out."
 
 
 def test_detail_bounce_shows_only_outbound_and_no_reply(
     db: Session, client_factory
 ) -> None:
-    """Bounced rows can't be replied to and have no inbound to show."""
+    """Bounced rows have no inbound to show — single-message thread."""
     user = _free_user(db)
     sq = _seed_bounced(db, user=user)
     body = client_factory(user).get(f"/api/v1/inbox/{sq.id}").json()
     assert body["category"] == "bounce"
-    assert body["can_reply"] is False
     assert len(body["messages"]) == 1
     assert body["messages"][0]["direction"] == "outbound"
 
@@ -433,19 +441,22 @@ def test_detail_outbound_reply_surfaces_after_inbound(
         "inbound",
         "outbound",
     ]
-    assert body["messages"][2]["body_text"] == "Here's my resume — link attached."
+    assert body["messages"][2]["body_html"] == "Here's my resume — link attached."
 
 
-def test_detail_html_escapes_user_content(db: Session, client_factory) -> None:
-    """body_html must escape angle brackets so a body containing literal HTML
-    doesn't break rendering or open an injection vector."""
+def test_detail_passes_through_special_chars_raw(
+    db: Session, client_factory
+) -> None:
+    """Pass-through contract: backend does NOT escape or wrap content. Same as
+    /today and /templates — frontend owns rendering. A body containing `<` or
+    `&` arrives at the frontend exactly as stored."""
     user = _free_user(db)
     sq = _seed_replied_with_body(
-        db, user=user, outbound_body="<script>alert(1)</script>"
+        db, user=user, outbound_body="<script>alert(1)</script> & more"
     )
     body = client_factory(user).get(f"/api/v1/inbox/{sq.id}").json()
-    assert "&lt;script&gt;" in body["messages"][0]["body_html"]
-    assert "<script>" not in body["messages"][0]["body_html"]
+    # Untouched — no escape, no wrap, no conversion.
+    assert body["messages"][0]["body_html"] == "<script>alert(1)</script> & more"
 
 
 # ─────────────────────────── POST /{id}/reply ───────────────────────────
@@ -458,7 +469,7 @@ def test_reply_404_for_unrelated_row(db: Session, client_factory) -> None:
     )
     sq = _seed_replied_with_body(db, user=bob)
     r = client_factory(alice).post(
-        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_html": "<p>Hi</p>"}
     )
     assert r.status_code == 404
 
@@ -468,7 +479,7 @@ def test_reply_409_when_row_is_bounce(db: Session, client_factory) -> None:
     user = _free_user(db)
     sq = _seed_bounced(db, user=user)
     r = client_factory(user).post(
-        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_html": "<p>Hi</p>"}
     )
     assert r.status_code == 409
 
@@ -477,7 +488,7 @@ def test_reply_400_when_body_empty(db: Session, client_factory) -> None:
     user = _free_user(db)
     sq = _seed_replied_with_body(db, user=user)
     r = client_factory(user).post(
-        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "   "}
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_html": "   "}
     )
     assert r.status_code == 400
 
@@ -513,13 +524,13 @@ def test_reply_happy_path_persists_outbound_text(
 
     r = client_factory(user).post(
         f"/api/v1/inbox/{sq.id}/reply",
-        json={"body_text": "Sure, here's my resume."},
+        json={"body_html": "<p>Sure, here's my resume.</p>"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
+    # Response shape per frontend's ReplyResultSchema: {ok: true, message_id}.
     assert body["ok"] is True
-    assert body["gmail_message_id"] == "msg-new-1"
-    assert body["gmail_thread_id"] == "thr-detail-1"
+    assert body["message_id"] == "msg-new-1"
 
     # Threading: must reuse the original gmail_thread_id + rfc822 message id.
     assert captured["gmail_thread_id"] == "thr-detail-1"
@@ -529,9 +540,10 @@ def test_reply_happy_path_persists_outbound_text(
     # Subject: Re:-prefixed (original was 'Quick intro about ML internship').
     assert captured["subject"].lower().startswith("re:")
 
-    # Denormalized on the row for the next detail render.
+    # Denormalized on the row for the next detail render — pass-through, the
+    # column stores whatever the composer sent (Tiptap HTML here).
     db.refresh(sq)
-    assert sq.outbound_reply_text == "Sure, here's my resume."
+    assert sq.outbound_reply_text == "<p>Sure, here's my resume.</p>"
     assert sq.outbound_reply_sent_at is not None
 
 
@@ -551,7 +563,7 @@ def test_reply_returns_401_on_gmail_auth_revoked(
     user = _free_user(db)
     sq = _seed_replied_with_body(db, user=user)
     r = client_factory(user).post(
-        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_html": "<p>Hi</p>"}
     )
     assert r.status_code == 401
 
@@ -575,7 +587,7 @@ def test_reply_maps_quota_to_429(db: Session, client_factory, monkeypatch) -> No
     user = _free_user(db)
     sq = _seed_replied_with_body(db, user=user)
     r = client_factory(user).post(
-        f"/api/v1/inbox/{sq.id}/reply", json={"body_text": "Hi"}
+        f"/api/v1/inbox/{sq.id}/reply", json={"body_html": "<p>Hi</p>"}
     )
     assert r.status_code == 429
 
