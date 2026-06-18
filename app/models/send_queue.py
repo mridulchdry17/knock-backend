@@ -73,6 +73,21 @@ class SendQueue(Base, CreatedAtMixin):
     replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reply_is_explicit_stop: Mapped[bool | None] = mapped_column(Boolean)
 
+    # Persisted at ingest time (reply_ingestor._process_reply) so the inbox
+    # detail view can render the latest inbound reply without a Gmail fetch.
+    # v0 stores only the most-recent reply; multi-turn back-and-forth will
+    # graduate to its own table when the product asks for it.
+    reply_body_text: Mapped[str | None] = mapped_column(Text)
+    reply_from_email: Mapped[str | None] = mapped_column(String(255))
+    reply_internal_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # When the user replies FROM Knock via POST /inbox/{id}/reply, we send via
+    # Gmail (threaded on the original conversation) and mirror the body+ts here
+    # so the next detail render shows their own reply without polling Gmail.
+    # v0 stores only the most recent outbound reply.
+    outbound_reply_text: Mapped[str | None] = mapped_column(Text)
+    outbound_reply_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     __table_args__ = (
         Index("idx_queue_due", "status", "scheduled_for"),
         Index("idx_queue_user_status", "user_id", "status"),

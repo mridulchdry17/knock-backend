@@ -85,6 +85,17 @@ def compute_send_times(batch_date: date, count: int, tier: Tier) -> list[datetim
     return [start + timedelta(minutes=step * i) for i in range(count)]
 
 
+def cadence_for_tier(tier: Tier, cap: int) -> timedelta:
+    """The gap between consecutive sends for a tier+cap. Matches the spacing
+    `compute_send_times` produces — free=1/hour; paid=window/(cap-1). Used by
+    the late-stamper to queue manual approvals at the same cadence as the
+    original schedule."""
+    if tier == "free" or cap <= 1:
+        return timedelta(hours=1)
+    window_minutes = (PAID_WINDOW_END_HOUR_UTC - SEND_WINDOW_START_HOUR_UTC) * 60
+    return timedelta(minutes=window_minutes / (cap - 1))
+
+
 # ─────────────────────────── picker ───────────────────────────
 
 
