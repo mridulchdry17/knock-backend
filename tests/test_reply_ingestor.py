@@ -432,6 +432,95 @@ def test_scraped_bounce_advances_to_next_pattern(db: Session) -> None:
     assert contact.email != "placeholder@acme.com"
 
 
+def test_scraped_bounce_self_collision_is_not_treated_as_collision(
+    db: Session,
+) -> None:
+    """Regression: when the next pattern's address happens to equal the
+    contact's CURRENT email (e.g. test seeded with email/pattern that don't
+    match, or two patterns yield the same local-part for a given name), the
+    collision lookup used to match the contact against itself and wrongly bail
+    to 'patterns exhausted' — invalidating with one guess still left."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    company = Company(domain="acme.com", name="Acme", source="scrape")
+    db.add(company)
+    db.flush()
+    # Hand-pick the collision: current email = 'john@acme.com', recorded as
+    # scraped from 'firstname.lastname'. With the pre-reshuffle order the next
+    # pattern is 'firstname' which builds 'john@acme.com' — same as current.
+    # Pre-fix, that self-match invalidated the contact; post-fix it should
+    # advance cleanly (the self-row isn't a real collision).
+    contact = Contact(
+        company_id=company.id,
+        name="John Doe",
+        email="john@acme.com",
+        scraped_pattern="firstname.lastname",
+    )
+    db.add(contact)
+    db.commit()
+    _seed_send_queue_row(
+        db, user=user, company=company, contact=contact, thread_id="thr-self"
+    )
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher,
+        "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-self", is_bounce=True)], 9),
+    ):
+        summary = ri.ingest_replies_for_user(db, user)
+
+    assert summary.bounces == 1
+    db.refresh(contact)
+    # MUST stay valid — there are still patterns ahead of 'firstname.lastname'.
+    assert contact.is_invalid is False
+    assert contact.invalid_reason is None
+    # The scraped_pattern must have ADVANCED past 'firstname.lastname'.
+    assert contact.scraped_pattern != "firstname.lastname"
+
+
+def test_scraped_bounce_does_collide_with_a_different_contact(
+    db: Session,
+) -> None:
+    """The collision check still fires against a DIFFERENT contact already
+    holding the next-pattern address — we don't want to clobber a real row."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    company = Company(domain="acme.com", name="Acme", source="scrape")
+    db.add(company)
+    db.flush()
+    # Pre-seed a different contact at the address the next pattern would yield.
+    Contact_other = Contact(
+        company_id=company.id, name="Squatter", email="john@acme.com"
+    )
+    db.add(Contact_other)
+    contact = Contact(
+        company_id=company.id,
+        name="John Doe",
+        email="john.doe@acme.com",
+        scraped_pattern="firstname.lastname",
+    )
+    db.add(contact)
+    db.commit()
+    _seed_send_queue_row(
+        db, user=user, company=company, contact=contact, thread_id="thr-collide"
+    )
+
+    with patch.object(ri, "get_user_credentials", return_value=object()), patch.object(
+        gmail_reply_fetcher,
+        "fetch_new_replies",
+        return_value=([_reply(thread_id="thr-collide", is_bounce=True)], 9),
+    ):
+        ri.ingest_replies_for_user(db, user)
+
+    db.refresh(contact)
+    # The next pattern (firstname) → john@acme.com collides with Squatter, so
+    # _handle_bounce must NOT advance to it. v0 behavior is to give up
+    # (single-shot advancement); future work could walk the order. The point
+    # of THIS test is just that we never clobber the other contact.
+    other = db.get(Contact, Contact_other.id)
+    assert other is not None
+    assert other.name == "Squatter"
+    assert other.email == "john@acme.com"
+
+
 def test_scraped_bounce_invalidates_when_patterns_exhausted(db: Session) -> None:
     user = _make_user(db, email="u@x.com", tier="free")
     company = Company(domain="acme.com", name="Acme", source="scrape")
