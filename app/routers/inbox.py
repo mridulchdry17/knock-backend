@@ -117,7 +117,11 @@ def list_inbox(
         )
         cat: InboxCategoryLit = _STATUS_TO_CATEGORY.get(r.status, "reply")
         # libsql strips tzinfo on storage — re-attach UTC at the boundary.
-        ts = ensure_utc(r.replied_at) if r.replied_at else ensure_utc(r.sent_at)
+        # Fallback chain: replied_at (REPLIED rows have it) → sent_at (BOUNCED
+        # rows always do — they came from already-dispatched send_queue rows)
+        # → created_at (NOT NULL via the mixin; defensive last-resort so the
+        # response schema can never see a missing timestamp).
+        ts = ensure_utc(r.replied_at or r.sent_at or r.created_at)
         items.append(
             InboxItemOut(
                 id=str(r.id),
