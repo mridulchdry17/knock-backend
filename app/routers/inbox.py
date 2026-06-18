@@ -17,7 +17,7 @@ from sqlalchemy import desc, func, select
 from app.core.deps import CurrentUser, DbDep, require_tier
 from app.core.errors import ApiError
 from app.core.pagination import PaginationParams, pagination
-from app.core.time import ensure_utc
+from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
 from app.models import Contact, SendQueue, User
 from app.schemas.inbox import (
@@ -26,10 +26,14 @@ from app.schemas.inbox import (
     InboxListOut,
     InboxSenderOut,
     InboxSyncStatusOut,
+    ReplyIn,
+    ReplyResultOut,
     ThreadDetailOut,
     ThreadMessageOut,
     ThreadParticipantOut,
 )
+from app.services import gmail_send
+from app.services.google_oauth import OAuthError, get_user_credentials
 
 router = APIRouter(
     prefix="/api/v1/inbox",
@@ -310,4 +314,165 @@ def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
         company_domain=sq.company_domain,
         can_reply=can_reply,
         messages=messages,
+    )
+
+
+def _reply_subject(original: str | None) -> str:
+    """Re:-prefix the original subject, but don't double-prefix if it's already
+    a reply chain. Case-insensitive on the prefix; preserves the original
+    user-authored text verbatim."""
+    s = (original or "").strip()
+    if not s:
+        return "Re:"
+    if s.lower().startswith("re:"):
+        return s
+    return f"Re: {s}"
+
+
+def _recipient_for_reply(sq: SendQueue, db) -> str | None:
+    """Pick the To address for an outbound reply.
+
+    Default: the address that wrote back to us (`reply_from_email`) — the
+    recruiter may have replied from a different alias than the one we addressed,
+    and going back to whoever wrote is the conventional behavior.
+
+    Fallback: the original `to_contact.email` for legacy rows where the
+    ingestor didn't store from_email.
+    """
+    if sq.reply_from_email:
+        return sq.reply_from_email
+    if sq.to_contact_id is not None:
+        contact = db.get(Contact, sq.to_contact_id)
+        if contact is not None and contact.email:
+            return contact.email
+    return None
+
+
+@router.post("/{item_id}/reply", response_model=ReplyResultOut)
+def post_reply(
+    item_id: int, payload: ReplyIn, user: CurrentUser, db: DbDep
+) -> ReplyResultOut:
+    """Send a reply on the original Gmail thread, from inside Knock.
+
+    Threading mechanics are delegated to `gmail_send.send_followup` — it sets
+    In-Reply-To + References + threadId so the reply lands inside the same
+    Gmail conversation. We persist the sent body on the send_queue row so the
+    next detail render shows the user their own reply without re-fetching.
+
+    The endpoint is intentionally synchronous: replies are user-initiated and
+    low-volume (vs. the scheduled batch worker), and the user wants to see a
+    confirmation immediately. Errors classify the same way the send worker does
+    — quota / auth-revoked / transient / recipient-rejected — and surface as
+    structured 4xx/5xx so the frontend can show specific copy.
+    """
+    sq = _load_owned_row(db, user, item_id)
+
+    # Same gating as can_reply on the detail view. Returning these as 409 so the
+    # frontend can distinguish "the row exists but can't be replied to" from a
+    # plain 404 — useful for showing a specific error message.
+    if sq.status != "REPLIED":
+        raise ApiError(
+            "cannot_reply",
+            "This item can't be replied to.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+    if not sq.gmail_thread_id:
+        raise ApiError(
+            "cannot_reply",
+            "Original thread is missing — replies aren't supported on this item.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    body_text = (payload.body_text or "").strip()
+    if not body_text:
+        raise ApiError(
+            "invalid_input",
+            "Reply body is required.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    to_email = _recipient_for_reply(sq, db)
+    if not to_email:
+        raise ApiError(
+            "cannot_reply",
+            "Recipient address not found.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    try:
+        creds = get_user_credentials(user)
+    except OAuthError as e:
+        # Mirrors the send worker's gmail_auth_revoked path. The frontend can
+        # show a "reconnect Gmail" CTA on this exact code.
+        raise ApiError(
+            "gmail_auth_revoked",
+            f"Gmail credentials are no longer valid: {e}",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        ) from e
+
+    subject = (payload.subject or "").strip() or _reply_subject(sq.subject)
+
+    result = gmail_send.send_followup(
+        creds,
+        sender_email=user.email,
+        sender_name=user.sender_signature_name or user.full_name,
+        to_email=to_email,
+        cc_emails=[],  # v0: no CC on user-initiated replies
+        subject=subject,
+        body_text=body_text,
+        gmail_thread_id=sq.gmail_thread_id,
+        # Best-effort In-Reply-To header. We persist rfc822_message_id at send
+        # time, but it may be missing for older rows; Gmail's threadId alone
+        # still threads correctly on Gmail's side.
+        in_reply_to_rfc822_id=sq.rfc822_message_id,
+    )
+
+    if not result.ok:
+        # Map gmail_send's failure_kind taxonomy to HTTP. Same taxonomy the
+        # send worker logs into email_failures.failure_kind so the dashboard
+        # error-counts stay coherent across batch + interactive sends.
+        kind = result.failure_kind or "unknown"
+        if kind == "gmail_auth_revoked":
+            http_status = status.HTTP_401_UNAUTHORIZED
+        elif kind == "quota_exceeded":
+            http_status = status.HTTP_429_TOO_MANY_REQUESTS
+        elif kind == "recipient_rejected":
+            http_status = status.HTTP_400_BAD_REQUEST
+        elif kind == "transient":
+            http_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            http_status = status.HTTP_502_BAD_GATEWAY
+
+        log.warning(
+            "inbox.reply_failed",
+            user_id=user.id,
+            send_queue_id=sq.id,
+            failure_kind=kind,
+            gmail_error_code=result.gmail_error_code,
+        )
+        raise ApiError(
+            kind,
+            result.error_message or "Gmail send failed.",
+            status_code=http_status,
+        )
+
+    # Persist on the send_queue row so the next detail render surfaces this
+    # send without a Gmail roundtrip. v0 only stores the last outbound reply
+    # (overwrites prior).
+    sq.outbound_reply_text = body_text
+    sq.outbound_reply_sent_at = utcnow()
+    db.add(sq)
+    db.commit()
+
+    log.info(
+        "inbox.reply_sent",
+        user_id=user.id,
+        send_queue_id=sq.id,
+        gmail_thread_id=result.gmail_thread_id,
+    )
+
+    return ReplyResultOut(
+        ok=True,
+        gmail_message_id=result.gmail_message_id,
+        gmail_thread_id=result.gmail_thread_id,
     )
