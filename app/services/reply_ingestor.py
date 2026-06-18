@@ -141,10 +141,15 @@ def _process_reply(
         is_explicit_stop=explicit,
     )
 
-    # Flip send_queue row.
+    # Flip send_queue row + denormalize the reply so the inbox detail view
+    # can render it without a Gmail fetch. v0 stores only the most-recent reply
+    # — re-ingesting on the same thread is no-op'd by the REPLIED guard above.
     sq.status = "REPLIED"
     sq.replied_at = ensure_utc(reply.internal_date)
     sq.reply_is_explicit_stop = explicit
+    sq.reply_body_text = reply.body_text
+    sq.reply_from_email = reply.from_email
+    sq.reply_internal_date = ensure_utc(reply.internal_date)
     db.add(sq)
 
     # Flip the source today_batch_item if it's still tracking this send.
