@@ -1,51 +1,63 @@
-"""Pydantic I/O contracts for the /inbox router (B5.6).
+"""Pydantic I/O contracts for the /inbox router.
 
-Surfaces every send_queue row with status='REPLIED' so the user sees
-exactly which outreaches got a reply, whether the reply was an explicit
-stop, and the current lock state for the company domain.
+Matches the F.7 frontend wire shape (`lib/inbox/types.ts`) so the page can
+parse the list response without snagging. The inbox surfaces three message
+categories:
+
+  - `reply`  — recruiter wrote back (send_queue.status='REPLIED')
+  - `bounce` — Gmail bounce / postmaster notice (send_queue.status='BOUNCED')
+  - `nudge`  — Knock-flagged "follow-up suggested" item (not implemented yet
+               — the filter is accepted but currently always returns empty)
 """
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel
 
+InboxCategoryLit = Literal["reply", "bounce", "nudge"]
+
+
+class InboxSenderOut(BaseModel):
+    """Minimal sender identity for the list row. Matches the frontend
+    `InboxSenderSchema` exactly — just name + email."""
+
+    name: str | None
+    email: str
+
 
 class InboxItemOut(BaseModel):
-    """One replied-to outreach in the user's inbox view."""
+    """One row in the inbox list. `id` is serialized as a string (React key /
+    path param); `message_count` is 1 for v0 (we don't track thread length
+    yet); `unread` defaults False until we add an unread column."""
 
-    id: int  # send_queue.id
-    contact_name: str | None
-    contact_email: str
-    company_name: str
-    company_domain: str
+    id: str
+    category: InboxCategoryLit
     subject: str
-    replied_at: datetime
-    reply_is_explicit_stop: bool
-    # lock_status mirrors `services.locks.LockStatus`:
-    #   "user_reply_lock" | "platform_permanent"
-    # The cooldown / available states are not surfaced here — an inbox row
-    # by definition got a reply, so one of those two locks must apply.
-    lock_status: str
-    locked_until: datetime | None
+    sender: InboxSenderOut
+    snippet: str
+    last_message_at: datetime
+    unread: bool = False
+    message_count: int = 1
 
 
 class InboxListOut(BaseModel):
+    """Envelope for the list endpoint. `unread_count` is required by the
+    frontend Zod schema (the missing-field was the snag); always 0 in v0."""
+
     items: list[InboxItemOut]
     total: int
-    limit: int
-    offset: int
+    unread_count: int = 0
 
 
 class InboxSyncStatusOut(BaseModel):
-    """Surface for the "last synced X mins ago" indicator on the inbox.
+    """Surface for the "last synced X mins ago" indicator.
 
-    `last_synced_at` reflects when the user's `gmail_history_id` was last
-    advanced (i.e. an ingest run completed for them). Null on first load
-    before any ingest has happened — frontend shows "never synced".
-    `syncing` is always False in v0 (single-process, no concurrent ingest);
-    placeholder for v1 when we add background async ingest.
+    `last_synced_at` reflects the most recent reply we've recorded for this
+    user (v0 proxy for "ingest completed"). `healthy` is required by the
+    frontend; True whenever the endpoint can answer at all.
     """
 
+    healthy: bool = True
     last_synced_at: datetime | None
-    syncing: bool
