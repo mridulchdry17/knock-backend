@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 InboxCategoryLit = Literal["reply", "bounce", "nudge"]
 
@@ -52,69 +52,101 @@ class InboxListOut(BaseModel):
 
 
 class ThreadParticipantOut(BaseModel):
-    """One side of the conversation — used for both the outbound (us) and the
-    inbound (recruiter). `name` is best-effort: we have it for contacts in the
-    pool but the reply ingestor only stores the inbound from_email, so the
-    reply's name may be None on the wire."""
+    """The recruiter side of the conversation, surfaced on ThreadDetailOut.sender.
+
+    Matches the frontend's `ThreadParticipantSchema`:
+      { name: nullable, email, role: nullable, company: nullable }
+
+    `role` comes from contacts.role (job title we scraped/seeded); `company`
+    is the company's display name (NOT the domain — the domain lives on the
+    list row's snippet path, not here).
+    """
 
     name: str | None
     email: str
+    role: str | None
+    company: str | None
 
 
 ThreadMessageDirection = Literal["outbound", "inbound"]
 
 
 class ThreadMessageOut(BaseModel):
-    """One message in the detail view's mini-thread.
+    """One message in the detail view's mini-thread. Matches the frontend's
+    `ThreadMessageSchema` 1:1 — same field naming convention used by /today
+    and /templates: backend is pure I/O, no rendering or escaping. The
+    `body_html` field carries the body as stored (Tiptap-authored HTML for
+    outbound, Gmail text/plain for inbound) — exact field name from the Zod
+    schema.
 
-    `body_html` is the rendered body. Our outbound is stored as plain text; we
-    wrap it in minimal `<p>` markup at response time so the frontend can render
-    it consistently. `body_text` is also returned for any consumer that needs
-    the raw form (e.g. populating the reply composer with a quoted block).
+    Serialization quirk: `from_` → `from` via `serialization_alias` because
+    `from` is a Python keyword. FastAPI dumps response models with
+    `by_alias=True`, so the wire field is `from`.
     """
 
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
     direction: ThreadMessageDirection
-    sender: ThreadParticipantOut
-    subject: str
-    body_text: str
+    from_: InboxSenderOut = Field(serialization_alias="from")
     body_html: str
     sent_at: datetime
+    is_knock_drafted_followup: bool | None = None
+
+
+class SuggestedFollowupOut(BaseModel):
+    """Knock-drafted follow-up the user can one-click send. Reserved for a
+    future iteration — the field is on ThreadDetailOut and always serialized
+    as null in v0 (the frontend's Zod expects the key, just nullable)."""
+
+    subject: str
+    body_html: str
+    reason: str
 
 
 class ThreadDetailOut(BaseModel):
-    """Conversation detail. v0 surfaces at most two messages — the outbound we
-    sent and the most-recent inbound reply (if any). `category` is the same
-    enum the list endpoint uses so the page can tag the header consistently.
-    `can_reply` is False for bounces (no live recipient to reply to) and for
-    any row missing a Gmail thread id."""
+    """Conversation detail — matches the frontend's `ThreadDetailSchema`.
+
+    `sender` is the recruiter we're talking to (the contact addressed by the
+    original outbound). `suggested_followup` is always null in v0; the column
+    is reserved so the wire shape stays stable when the feature lands.
+
+    Note: extra backend-internal fields like `company_domain` / `can_reply`
+    are NOT serialized — Zod silently strips them, but omitting keeps the wire
+    contract tight.
+    """
 
     id: str
-    category: InboxCategoryLit
     subject: str
-    company_domain: str | None
-    can_reply: bool
+    category: InboxCategoryLit
+    sender: ThreadParticipantOut
     messages: list[ThreadMessageOut]
+    suggested_followup: SuggestedFollowupOut | None = None
 
 
 class ReplyIn(BaseModel):
-    """Payload for POST /inbox/{id}/reply. `body_text` is plain text authored
-    by the user in the Knock composer; we own the threading headers and the
-    Gmail thread linkage server-side — the client only sends the message body
-    (and an optional subject override for the rare case the user wants to
-    rename the Re: line)."""
+    """Payload for POST /inbox/{id}/reply. `body_html` matches the frontend's
+    Zod field name; contents are whatever the composer produces (Tiptap's
+    HTML output by default). Backend is pass-through — `gmail_send.build_mime`
+    flattens to text/plain for the actual Gmail send. Subject is optional —
+    the router prefixes 'Re:' when omitted."""
 
-    body_text: str
+    body_html: str
     subject: str | None = None
 
 
 class ReplyResultOut(BaseModel):
-    """Outcome of a reply send. Mirrors send_email's success path — the new
-    Gmail message id + the same thread id the original used. Failures come
-    back as a structured ApiError (4xx/5xx), not this shape."""
+    """Success-only shape — matches frontend's `ReplyResultSchema`:
+      { ok: true, message_id: string }
 
-    ok: bool
-    gmail_message_id: str | None
-    gmail_thread_id: str | None
+    `message_id` is Gmail's API id for the newly-sent reply (was previously
+    surfaced as `gmail_message_id`; renamed to match the frontend's field
+    name). Failures come back as a structured ApiError (4xx/5xx), not this
+    shape, so `ok` is always literally true here.
+    """
+
+    ok: Literal[True] = True
+    message_id: str
 
 
 class InboxSyncStatusOut(BaseModel):
