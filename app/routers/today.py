@@ -502,6 +502,11 @@ def apply_template_to_batch(
 
     sender_name = user.sender_signature_name or user.full_name
 
+    # Track which rows got promoted default→ready in this call so we can
+    # restamp ONLY those (any rows that were already 'ready' before this call
+    # may have intentional send_times the user / picker chose — leave them).
+    promoted_to_ready: list[TodayBatchItem] = []
+
     rewritten = 0
     kept_edited = 0
     skipped_terminal = 0
@@ -524,10 +529,23 @@ def apply_template_to_batch(
         item.body = rendered_body
         if item.status == "default":
             item.status = "ready"
+            promoted_to_ready.append(item)
         db.add(item)
         rewritten += 1
 
     db.commit()
+
+    # Apply the same late-restamp rule /send-batch and PATCH /items already
+    # follow: a card that just transitioned default→ready whose send_time has
+    # already passed gets queued at the BACK of the schedule at the tier's
+    # cadence. Without this, an apply-template at 11 AM on cards originally
+    # slotted 6 AM-noon would leave 6 'ready' rows with past send_times — and
+    # the next scheduler tick would blast them all in a single drain.
+    now = utcnow()
+    late, _future = send_scheduling.partition_late(promoted_to_ready, now=now)
+    if late:
+        send_scheduling.stamp_late_items_for_user(db, user, late, now=now)
+        db.commit()
 
     log.info(
         "today.apply_template",
@@ -536,6 +554,7 @@ def apply_template_to_batch(
         rewritten=rewritten,
         kept_edited=kept_edited,
         skipped_terminal=skipped_terminal,
+        late_restamped=len(late),
     )
     return ApplyTemplateResultOut(
         rewritten=rewritten,

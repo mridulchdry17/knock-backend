@@ -504,7 +504,7 @@ def test_reply_happy_path_persists_outbound_text(
 
     captured: dict = {}
 
-    def _fake_send_followup(creds, **kwargs):  # noqa: ANN001 — test stub
+    def _fake_send_followup(creds, **kwargs):
         captured.update(kwargs)
         return gmail_send.SendResult(
             ok=True,
