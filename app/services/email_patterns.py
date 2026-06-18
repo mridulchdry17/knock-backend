@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import re
 
-# Priority order. firstname.lastname is the v0 default first guess; firstname@
-# is the common second; the rest cover the usual corporate variants.
+# Priority order. firstname@ is the dominant pattern at startups/VC-backed
+# companies; firstname.lastname@ is the reliable corporate fallback second.
 EMAIL_PATTERN_ORDER: list[str] = [
-    "firstname.lastname",   # akanksha.puri@
     "firstname",            # akanksha@
+    "firstname.lastname",   # akanksha.puri@
     "f.lastname",           # a.puri@
     "firstnamelastname",    # akankshapuri@
     "firstname_lastname",   # akanksha_puri@
