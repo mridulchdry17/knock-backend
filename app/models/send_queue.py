@@ -81,6 +81,13 @@ class SendQueue(Base, CreatedAtMixin):
     reply_from_email: Mapped[str | None] = mapped_column(String(255))
     reply_internal_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # When the user replies FROM Knock via POST /inbox/{id}/reply, we send via
+    # Gmail (threaded on the original conversation) and mirror the body+ts here
+    # so the next detail render shows their own reply without polling Gmail.
+    # v0 stores only the most recent outbound reply.
+    outbound_reply_text: Mapped[str | None] = mapped_column(Text)
+    outbound_reply_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     __table_args__ = (
         Index("idx_queue_due", "status", "scheduled_for"),
         Index("idx_queue_user_status", "user_id", "status"),

@@ -276,6 +276,24 @@ def get_thread(item_id: int, user: CurrentUser, db: DbDep) -> ThreadDetailOut:
             )
         )
 
+    # User's outbound reply from Knock (POST /inbox/{id}/reply). Surfaced AFTER
+    # the inbound because chronologically a reply comes after the message it's
+    # responding to; v0 stores only the most recent outbound reply so this is
+    # at most one row.
+    if sq.outbound_reply_text:
+        messages.append(
+            ThreadMessageOut(
+                direction="outbound",
+                sender=outbound_sender,
+                subject=sq.subject or "",
+                body_text=sq.outbound_reply_text,
+                body_html=_to_html(sq.outbound_reply_text),
+                sent_at=ensure_utc(
+                    sq.outbound_reply_sent_at or sq.replied_at or sq.created_at
+                ),
+            )
+        )
+
     # Replying needs a Gmail thread to land on + (ideally) an RFC822 Message-ID
     # for the In-Reply-To header. Bounces can't be replied to (no human at the
     # other end). Legacy rows without a thread id can't thread reliably either.
