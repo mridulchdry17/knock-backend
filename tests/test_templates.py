@@ -84,9 +84,12 @@ def test_render_flattens_rich_text_html_body_to_plain_text() -> None:
         sender_name="Mridul Chaudhary",
     )
     assert "<p>" not in body and "</p>" not in body and "<span" not in body
+    # Tiptap's consecutive `<p>` paragraphs flatten to single newlines so they
+    # stack tight when reloaded into a textarea (matches the editor's preview).
+    # A `<br>` inside a paragraph stays a single newline.
     assert body == (
-        "Hi Alex,\n\n"
-        "I'm a student really interested in Acme Inc.\n\n"
+        "Hi Alex,\n"
+        "I'm a student really interested in Acme Inc.\n"
         "Best,\nMridul Chaudhary"
     )
 
