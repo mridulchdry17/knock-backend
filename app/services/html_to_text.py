@@ -27,7 +27,13 @@ _LOOKS_LIKE_HTML = re.compile(r"<[A-Za-z/!]")
 
 _BR_RE = re.compile(r"(?i)<br\s*/?>")
 _LIST_ITEM_RE = re.compile(r"(?i)<li[^>]*>")
-# Closing block tags become a paragraph break.
+# Closing block tags become a SINGLE newline. Tiptap emits one `<p>` per
+# Enter-keypress, and the editor's preview renders consecutive `<p>` tags
+# tightly (no visible gap unless the user adds an empty paragraph). Treating
+# every `</p>` close as a blank-line break here doubled the visual spacing
+# whenever the flattened body was loaded back into a textarea (e.g. /today
+# card editor). Explicit `<p></p>` empty paragraphs still produce a blank line
+# because two consecutive `</p>` closes become two newlines.
 _BLOCK_CLOSE_RE = re.compile(r"(?i)</(p|div|li|h[1-6]|blockquote|tr|ul|ol)\s*>")
 _TAG_RE = re.compile(r"<[^>]+>")
 _TRAILING_WS_RE = re.compile(r"[ \t]+\n")
@@ -41,7 +47,7 @@ def html_to_text(s: str) -> str:
 
     out = _BR_RE.sub("\n", s)
     out = _LIST_ITEM_RE.sub("• ", out)
-    out = _BLOCK_CLOSE_RE.sub("\n\n", out)
+    out = _BLOCK_CLOSE_RE.sub("\n", out)
     out = _TAG_RE.sub("", out)
     out = _html.unescape(out)
     out = out.replace("\xa0", " ")  # any &nbsp; that slipped through
