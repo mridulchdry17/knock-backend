@@ -58,7 +58,12 @@ class Settings(BaseSettings):
     # platform-wide cohort hold (any user → blocks everyone) and the 2-day
     # post-reply user lock.
     USER_CONTACT_COOLDOWN_DAYS: int = 30
-    SESSION_TTL_DAYS: int = 30
+    # Two-token auth (migration 0022). The `sessions` row is the SHORT-lived
+    # access token (in-memory on the client; ~15 min TTL bounds XSS exfil).
+    # The LONG-lived state lives in `refresh_tokens` as an HttpOnly cookie —
+    # JS can never read it, so 30 days is safe.
+    ACCESS_TOKEN_TTL_MINUTES: int = 15
+    REFRESH_TOKEN_TTL_DAYS: int = 30
 
     LOG_LEVEL: str = "INFO"
     # Master switch for the in-process autopilot scheduler (APScheduler). OFF by
