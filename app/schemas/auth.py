@@ -14,3 +14,11 @@ class MeOut(ORMModel):
     has_gmail_connected: bool
     daily_limit: int
     sent_today: int
+
+
+class RefreshOut(ORMModel):
+    """Returned by POST /api/v1/auth/refresh — the freshly-minted access token.
+    The new refresh token is set as an HttpOnly cookie on the same response;
+    only the access token is JSON-readable (frontend stores it in memory)."""
+
+    access_token: str

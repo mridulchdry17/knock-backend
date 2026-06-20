@@ -52,3 +52,15 @@ def revoke_family(db: OrmSession, family_id: str) -> int:
         .values(revoked_at=utcnow())
     )
     return int(result.rowcount or 0)
+
+
+def revoke_all_for_user(db: OrmSession, user_id: int) -> int:
+    """Nuke every active refresh token for a user — used by /disconnect
+    (force re-auth on every device). Returns count of newly-revoked rows."""
+    result = db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user_id)
+        .where(RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow())
+    )
+    return int(result.rowcount or 0)
