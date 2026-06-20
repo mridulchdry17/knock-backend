@@ -41,3 +41,8 @@ htmlcov/
 # Logs
 *.log
 logs/
+
+# Stray libsql ':memory:' sentinel files that sometimes appear if a connection
+# string mis-routes through the local engine. Never commit these.
+:memory:
+:memory:-*

@@ -203,10 +203,111 @@ def test_list_waitlist(client_factory, db: Session, super_admin: User) -> None:
     db.commit()
 
     client = client_factory(super_admin)
+    # Default status=pending — both fresh rows are pending.
     r = client.get("/api/v1/admin/waitlist")
     assert r.status_code == 200
     body = r.json()
     assert body["total"] == 2
+
+
+def test_list_waitlist_search_matches_email_substring(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """Search filter is a case-insensitive substring match on email."""
+    waitlist_repo.add(db, "alice@stripe.com")
+    waitlist_repo.add(db, "bob@notion.so")
+    waitlist_repo.add(db, "carol@stripe.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist?search=stripe")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2
+    emails = sorted(item["email"] for item in body["items"])
+    assert emails == ["alice@stripe.com", "carol@stripe.com"]
+
+    # Case-insensitive.
+    r2 = client.get("/api/v1/admin/waitlist?search=ALICE")
+    assert r2.json()["total"] == 1
+
+
+def test_list_waitlist_status_filter_pending_excludes_approved(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    e1 = waitlist_repo.add(db, "pending@x.com")
+    e2 = waitlist_repo.add(db, "approved@x.com")
+    waitlist_repo.set_approved(db, e2, approved=True)
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist?status=pending")
+    body = r.json()
+    assert body["total"] == 1
+    assert body["items"][0]["email"] == "pending@x.com"
+
+    # And confirm e1 is still on the list (sanity).
+    assert waitlist_repo.get(db, e1.id) is not None
+
+
+def test_list_waitlist_status_filter_approved_excludes_pending(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    waitlist_repo.add(db, "pending@x.com")
+    e2 = waitlist_repo.add(db, "approved@x.com")
+    waitlist_repo.set_approved(db, e2, approved=True)
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist?status=approved")
+    body = r.json()
+    assert body["total"] == 1
+    assert body["items"][0]["email"] == "approved@x.com"
+
+
+def test_list_waitlist_status_all_returns_both(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    waitlist_repo.add(db, "pending@x.com")
+    e2 = waitlist_repo.add(db, "approved@x.com")
+    waitlist_repo.set_approved(db, e2, approved=True)
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist?status=all")
+    assert r.json()["total"] == 2
+
+
+def test_list_waitlist_sort_oldest(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """Sort=oldest reverses the default newest-first order."""
+    import time as _time
+
+    waitlist_repo.add(db, "first@x.com")
+    db.commit()
+    _time.sleep(0.01)  # ensure created_at differs
+    waitlist_repo.add(db, "second@x.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    items = client.get("/api/v1/admin/waitlist?sort=oldest").json()["items"]
+    assert [i["email"] for i in items[:2]] == ["first@x.com", "second@x.com"]
+
+    items = client.get("/api/v1/admin/waitlist?sort=newest").json()["items"]
+    assert [i["email"] for i in items[:2]] == ["second@x.com", "first@x.com"]
+
+
+def test_list_waitlist_unknown_status_falls_back_to_all(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """A typo in ?status= shouldn't 500 — fall back to all."""
+    waitlist_repo.add(db, "x@y.com")
+    db.commit()
+    client = client_factory(super_admin)
+    r = client.get("/api/v1/admin/waitlist?status=garbage")
+    assert r.status_code == 200
+    assert r.json()["total"] == 1
 
 
 def test_waitlist_csv_export(client_factory, db: Session, super_admin: User) -> None:
@@ -383,6 +484,124 @@ def test_approve_waitlist_requires_super_admin(client_factory, db: Session) -> N
     user = _make_user(db, email="free@x.com", google_sub="g-f", tier="free")
     client = client_factory(user)
     assert client.post("/api/v1/admin/waitlist/1/approve").status_code == 403
+
+
+# ─────────────────────────── bulk approve ───────────────────────────
+
+
+def test_bulk_approve_happy_path(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    e1 = waitlist_repo.add(db, "a@x.com")
+    e2 = waitlist_repo.add(db, "b@x.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.post(
+        "/api/v1/admin/waitlist/approve-bulk",
+        json={"ids": [e1.id, e2.id]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["newly_approved"] == 2
+    assert body["already_approved"] == 0
+    assert body["not_found_ids"] == []
+
+    db.expire_all()
+    assert waitlist_repo.get(db, e1.id).approved_at is not None  # type: ignore[union-attr]
+    assert waitlist_repo.get(db, e2.id).approved_at is not None  # type: ignore[union-attr]
+
+
+def test_bulk_approve_mixed_pending_and_already_approved(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """Mixed list: previously-approved rows count toward `already_approved`,
+    not `newly_approved` — and they aren't double-stamped."""
+    e1 = waitlist_repo.add(db, "pending@x.com")
+    e2 = waitlist_repo.add(db, "already@x.com")
+    waitlist_repo.set_approved(db, e2, approved=True)
+    db.commit()
+    original_approved_at = e2.approved_at
+
+    client = client_factory(super_admin)
+    r = client.post(
+        "/api/v1/admin/waitlist/approve-bulk",
+        json={"ids": [e1.id, e2.id]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["newly_approved"] == 1
+    assert body["already_approved"] == 1
+    assert body["not_found_ids"] == []
+
+    db.expire_all()
+    # The already-approved row's timestamp is preserved (no churn).
+    e2_after = waitlist_repo.get(db, e2.id)
+    assert e2_after is not None
+    assert e2_after.approved_at == original_approved_at
+
+
+def test_bulk_approve_returns_not_found_ids(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    e1 = waitlist_repo.add(db, "a@x.com")
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.post(
+        "/api/v1/admin/waitlist/approve-bulk",
+        json={"ids": [e1.id, 99999, 88888]},
+    )
+    body = r.json()
+    assert body["newly_approved"] == 1
+    assert sorted(body["not_found_ids"]) == [88888, 99999]
+
+
+def test_bulk_approve_empty_ids_returns_zeros(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    client = client_factory(super_admin)
+    r = client.post("/api/v1/admin/waitlist/approve-bulk", json={"ids": []})
+    body = r.json()
+    assert body == {"newly_approved": 0, "already_approved": 0, "not_found_ids": []}
+
+
+def test_bulk_approve_promotes_linked_pending_users(
+    client_factory, db: Session, super_admin: User
+) -> None:
+    """The per-row sync side-effect (promote pending user → free) must fire
+    for each id in a bulk approval, identical to the single-row endpoint."""
+    e = waitlist_repo.add(db, "tester@x.com")
+    user = _make_user(
+        db,
+        email="tester@x.com",
+        google_sub="g-tester",
+        tier="pending",
+        waitlist_email="tester@x.com",
+    )
+    db.commit()
+
+    client = client_factory(super_admin)
+    r = client.post(
+        "/api/v1/admin/waitlist/approve-bulk",
+        json={"ids": [e.id]},
+    )
+    assert r.status_code == 200
+    db.expire_all()
+    refreshed = db.get(type(user), user.id)
+    assert refreshed is not None
+    assert refreshed.tier == "free"
+
+
+def test_bulk_approve_requires_super_admin(
+    client_factory, db: Session
+) -> None:
+    user = _make_user(db, email="free@x.com", google_sub="g-f", tier="free")
+    client = client_factory(user)
+    r = client.post(
+        "/api/v1/admin/waitlist/approve-bulk", json={"ids": [1]}
+    )
+    assert r.status_code == 403
 
 
 # ─────────────────────────── pagination bounds ───────────────────────────
