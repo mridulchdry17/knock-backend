@@ -18,6 +18,7 @@ class TemplateOut(BaseModel):
     subject: str
     body: str
     is_starter: bool
+    is_default: bool
     used_count: int
     reply_rate: float | None
     created_at: datetime

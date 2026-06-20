@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, status
 
 from app.core.deps import CurrentUser, DbDep, require_tier
+from app.core.errors import ApiError
 from app.logging_config import get_logger
 from app.repositories import templates as templates_repo
 from app.schemas.common import Ok
@@ -39,6 +40,7 @@ def _view_to_out(v: TemplateView) -> TemplateOut:
         subject=t.subject,
         body=t.body,
         is_starter=t.is_starter,
+        is_default=t.is_default,
         used_count=v.used_count,
         reply_rate=v.reply_rate,
         created_at=t.created_at,
@@ -106,3 +108,29 @@ def test_send_template(
 ) -> TestSendResult:
     templates_svc.test_send(db, user, template_id)
     return TestSendResult(sent=True)
+
+
+@router.post("/{template_id}/default", response_model=TemplateOut)
+def set_default_template(
+    template_id: int, user: CurrentUser, db: DbDep
+) -> TemplateOut:
+    """Make this template the user's autopilot default.
+
+    Atomic — unsets is_default on every OTHER template for this user, then
+    sets it on the target. Returns the now-default template so the
+    frontend can update its UI without a refetch. 404 if the id doesn't
+    belong to the user (no existence-side-channel for other users' ids)."""
+    t = templates_repo.set_default(db, user_id=user.id, template_id=template_id)
+    if t is None:
+        raise ApiError(
+            "not_found",
+            "Template not found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    db.commit()
+    db.refresh(t)
+    used = templates_repo.used_counts_for_user(db, user.id)
+    log.info("templates.set_default", user_id=user.id, template_id=t.id)
+    return _view_to_out(
+        TemplateView(template=t, used_count=used.get(t.id, 0), reply_rate=None)
+    )
