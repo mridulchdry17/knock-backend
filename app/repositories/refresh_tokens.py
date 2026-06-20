@@ -28,9 +28,7 @@ def is_active(row: RefreshToken) -> bool:
         return False
     if ensure_utc(row.expires_at) <= utcnow():
         return False
-    if row.replaced_by_id is not None:
-        return False
-    return True
+    return row.replaced_by_id is None
 
 
 def revoke(db: OrmSession, row: RefreshToken, *, replaced_by_id: str | None = None) -> None:
