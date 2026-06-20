@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from app.services.email_text import reflow_for_email
 from app.services.html_to_text import html_to_text
 
 if TYPE_CHECKING:
@@ -117,7 +118,13 @@ def build_mime(
     # stored as HTML before this shipped (or any path that bypasses render)
     # would otherwise reach the recipient with literal <p>…</p> tags, since
     # the message is text/plain. Idempotent on already-plain text.
-    msg.set_content(html_to_text(body_text))
+    plain = html_to_text(body_text)
+    # Reflow at the email boundary: join cosmetic line wraps within
+    # paragraphs into one flowing line, but preserve blank-line paragraph
+    # breaks and list structure. Without this, every Enter the user pressed
+    # in the Tiptap editor becomes a HARD line break in the recipient's
+    # email — chopped fragments instead of natural prose.
+    msg.set_content(reflow_for_email(plain))
     return msg, rfc822_id
 
 
