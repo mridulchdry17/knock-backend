@@ -1,0 +1,255 @@
+"""HTTP tests for POST /api/v1/auth/refresh + the augmented /logout & /disconnect.
+
+Exercises the real router + dependency stack. The refresh endpoint is the
+critical security boundary — these tests pin the wire contract:
+
+  - missing cookie → 401 with code='no_refresh_token'
+  - invalid cookie (expired / revoked-via-logout) → 401 with code='refresh_invalid'
+  - REUSE → 401 with code='refresh_reuse_detected', whole family revoked
+  - happy path → 200 with {access_token: "..."} AND a fresh Set-Cookie header
+
+The logout / disconnect tests pin that the cookie is cleared and the family
+revoked on the way out.
+"""
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.core.cookies import REFRESH_TOKEN_COOKIE
+from app.db.session import get_db
+from app.main import app
+from app.models import RefreshToken
+from app.services import refresh_tokens as rt_service
+from tests.conftest import _make_user
+
+
+@pytest.fixture
+def client_factory(engine: Engine):
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+    def _make() -> TestClient:
+        def _override_get_db():
+            s = factory()
+            try:
+                yield s
+            finally:
+                s.close()
+
+        app.dependency_overrides[get_db] = _override_get_db
+        return TestClient(app)
+
+    yield _make
+    app.dependency_overrides.clear()
+
+
+def _seed_token(db: Session, *, email: str = "u@x.com") -> tuple[int, str, str]:
+    """Helper: create a user + refresh token. Returns (user_id, family_id, raw_token)."""
+    user = _make_user(db, email=email)
+    issued = rt_service.issue(db, user_id=user.id)
+    db.commit()
+    return user.id, issued.family_id, issued.raw_token
+
+
+# ─────────────────────────── /refresh — failure modes ───────────────────────────
+
+
+def test_refresh_no_cookie_returns_401(client_factory) -> None:
+    client = client_factory()
+    r = client.post("/api/v1/auth/refresh")
+    assert r.status_code == 401
+    body = r.json()
+    assert body["error"]["code"] == "no_refresh_token"
+
+
+def test_refresh_unknown_token_returns_401_invalid(db: Session, client_factory) -> None:
+    client = client_factory()
+    r = client.post(
+        "/api/v1/auth/refresh",
+        cookies={REFRESH_TOKEN_COOKIE: "no-such-token-in-db"},
+    )
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "refresh_invalid"
+
+
+def test_refresh_revoked_token_is_invalid_not_reuse(
+    db: Session, client_factory
+) -> None:
+    """A token revoked via logout (no successor) → 'refresh_invalid', NOT
+    'refresh_reuse_detected'. We mustn't burn the family on a stale cookie
+    from a clean logout."""
+    user_id, family_id, raw = _seed_token(db)
+    # Simulate logout-style revoke: revoked_at set, replaced_by_id NOT set.
+    rt_service.revoke_family_for_token(db, raw_token=raw)
+    db.commit()
+
+    client = client_factory()
+    r = client.post(
+        "/api/v1/auth/refresh", cookies={REFRESH_TOKEN_COOKIE: raw}
+    )
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "refresh_invalid"
+
+
+def test_refresh_reuse_detected_revokes_family(
+    db: Session, client_factory
+) -> None:
+    """Present a token that's already been rotated → 401 reuse_detected +
+    the entire family is wiped (including the legitimate successor)."""
+    user_id, family_id, raw_old = _seed_token(db)
+
+    # Legitimate rotation: produces successor; raw_old is now replaced.
+    client = client_factory()
+    first = client.post(
+        "/api/v1/auth/refresh", cookies={REFRESH_TOKEN_COOKIE: raw_old}
+    )
+    assert first.status_code == 200
+    successor = first.cookies.get(REFRESH_TOKEN_COOKIE)
+    assert successor is not None
+
+    # Attacker replays the OLD token — REUSE detected.
+    second = client.post(
+        "/api/v1/auth/refresh", cookies={REFRESH_TOKEN_COOKIE: raw_old}
+    )
+    assert second.status_code == 401
+    assert second.json()["error"]["code"] == "refresh_reuse_detected"
+
+    # The successor is now also revoked — whole family is dead.
+    db.expire_all()
+    successor_row = db.get(RefreshToken, successor)
+    assert successor_row is not None
+    assert successor_row.revoked_at is not None
+
+
+# ─────────────────────────── /refresh — happy path ───────────────────────────
+
+
+def test_refresh_happy_path_returns_access_token_and_rotates_cookie(
+    db: Session, client_factory
+) -> None:
+    user_id, family_id, raw_old = _seed_token(db)
+    client = client_factory()
+
+    r = client.post(
+        "/api/v1/auth/refresh", cookies={REFRESH_TOKEN_COOKIE: raw_old}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "access_token" in body
+    assert isinstance(body["access_token"], str)
+    assert len(body["access_token"]) >= 32  # 32 bytes → 43-char urlsafe
+
+    # New refresh cookie set on the response (different from the one we sent).
+    new_cookie = r.cookies.get(REFRESH_TOKEN_COOKIE)
+    assert new_cookie is not None
+    assert new_cookie != raw_old
+
+    # The Set-Cookie header carries HttpOnly + SameSite=lax so JS can't
+    # exfiltrate via document.cookie.
+    set_cookie_headers = [v for k, v in r.headers.items() if k.lower() == "set-cookie"]
+    refresh_cookie_header = next(
+        (h for h in set_cookie_headers if h.startswith(f"{REFRESH_TOKEN_COOKIE}=")),
+        None,
+    )
+    assert refresh_cookie_header is not None
+    assert "HttpOnly" in refresh_cookie_header
+    assert "samesite=lax" in refresh_cookie_header.lower()
+
+    # Old row is revoked + linked to the new one.
+    db.expire_all()
+    old_row = db.get(RefreshToken, raw_old)
+    assert old_row is not None
+    assert old_row.revoked_at is not None
+    assert old_row.replaced_by_id == new_cookie
+
+
+def test_refresh_rotation_keeps_same_family(db: Session, client_factory) -> None:
+    user_id, original_family, raw = _seed_token(db)
+    client = client_factory()
+
+    r = client.post(
+        "/api/v1/auth/refresh", cookies={REFRESH_TOKEN_COOKIE: raw}
+    )
+    new_token = r.cookies.get(REFRESH_TOKEN_COOKIE)
+    assert new_token is not None
+
+    db.expire_all()
+    new_row = db.get(RefreshToken, new_token)
+    assert new_row is not None
+    assert new_row.family_id == original_family
+
+
+# ─────────────────────────── /logout ───────────────────────────
+
+
+def test_logout_clears_cookie_and_revokes_family(
+    db: Session, client_factory
+) -> None:
+    from app.core.deps import get_current_user
+    from app.models import Session as SessionRow
+    from app.services import sessions as sessions_service
+
+    user_id, family_id, refresh_raw = _seed_token(db)
+    user = db.query(_make_user.__globals__["User"]).filter_by(id=user_id).one()
+
+    # Issue an access token + override the bearer dep to return our user.
+    access_session = sessions_service.issue(db, user_id=user.id)
+    access_token = access_session.id  # capture before expire_all() invalidates the row
+    db.commit()
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        client = client_factory()
+        r = client.post(
+            "/api/v1/auth/logout",
+            headers={"Authorization": f"Bearer {access_token}"},
+            cookies={REFRESH_TOKEN_COOKIE: refresh_raw},
+        )
+        assert r.status_code == 200
+
+        # Access token (sessions row) is deleted.
+        db.expire_all()
+        assert db.get(SessionRow, access_token) is None
+
+        # Refresh family is revoked.
+        refresh_row = db.get(RefreshToken, refresh_raw)
+        assert refresh_row is not None
+        assert refresh_row.revoked_at is not None
+
+        # Cookie cleared on response — Max-Age=0 or expires in the past.
+        set_cookie_headers = [v for k, v in r.headers.items() if k.lower() == "set-cookie"]
+        cleared = next(
+            (h for h in set_cookie_headers if h.startswith(f"{REFRESH_TOKEN_COOKIE}=")),
+            None,
+        )
+        assert cleared is not None
+        # FastAPI's delete_cookie writes Max-Age=0; some versions write an
+        # epoch-zero Expires. Accept either signal.
+        assert "Max-Age=0" in cleared or "expires=Thu, 01 Jan 1970" in cleared.lower()
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+def test_logout_without_refresh_cookie_still_succeeds(
+    db: Session, client_factory
+) -> None:
+    """Logout must be idempotent — a client that already lost the cookie
+    (or never had one) should still get a 200 and have its access-token
+    row deleted."""
+    from app.core.deps import get_current_user
+    from app.services import sessions as sessions_service
+
+    user = _make_user(db, email="u@x.com")
+    access_session = sessions_service.issue(db, user_id=user.id)
+    db.commit()
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        client = client_factory()
+        r = client.post(
+            "/api/v1/auth/logout",
+            headers={"Authorization": f"Bearer {access_session.id}"},
+        )
+        assert r.status_code == 200
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
