@@ -23,6 +23,11 @@ class Template(Base, CreatedAtMixin):
     # True for the 3 templates seeded on first login. Lets the UI badge them and
     # distinguishes seeded vs user-authored.
     is_starter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # The user's autopilot template. Exactly one row per user should be true
+    # at any time — invariant is enforced by `templates_svc.set_default` via
+    # an atomic UPDATE (not at the DB level; a partial unique index isn't
+    # worth the libsql/SQLite migration cost for v0).
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Nullable in the migration for any legacy rows; the model sets + bumps it.
     updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
