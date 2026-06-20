@@ -58,6 +58,24 @@ class ApproveWaitlistIn(BaseModel):
     tier: Literal["free", "paid"] = "free"
 
 
+class BulkApproveWaitlistIn(BaseModel):
+    """POST /admin/waitlist/approve-bulk — approve N rows in one call. All
+    rows get the same `tier` (defaults to 'free'); per-row tier overrides
+    would need a different endpoint shape."""
+
+    ids: list[int]
+    tier: Literal["free", "paid"] = "free"
+
+
+class BulkApproveWaitlistOut(BaseModel):
+    """Result of a bulk approval. Idempotent: previously-approved rows count
+    toward `already_approved`, not `newly_approved`."""
+
+    newly_approved: int
+    already_approved: int
+    not_found_ids: list[int]
+
+
 # ─────────────────────────── contacts (B5.1) ───────────────────────────
 
 
