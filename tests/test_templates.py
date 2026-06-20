@@ -117,6 +117,105 @@ def test_seed_starters_is_idempotent(db: Session) -> None:
     assert templates_svc.templates_repo.count_for_user(db, user.id) == 3
 
 
+def test_seed_starters_marks_first_as_default(db: Session) -> None:
+    """The first starter seeded becomes is_default=true so autopilot has an
+    explicit pick from day one — matches the legacy implicit-default
+    (oldest starter) but makes the choice changeable from the UI."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    templates_svc.seed_starters(db, user)
+    db.commit()
+    rows = templates_svc.templates_repo.list_for_user(db, user.id)
+    defaults = [t for t in rows if t.is_default]
+    assert len(defaults) == 1
+    # And it's the first one in seed order — same as the implicit chain
+    # default_for_user would've picked pre-feature.
+    assert defaults[0].name == templates_svc.STARTER_TEMPLATES[0]["name"]
+
+
+# ─────────────────────────── default_for_user / set_default ───────────────────────────
+
+
+def test_default_for_user_respects_explicit_flag_over_starter(db: Session) -> None:
+    """is_default beats is_starter beats created_at in the priority chain."""
+    user = _make_user(db, email="u@x.com", tier="free")
+    # Seed starters first (oldest = is_default=true).
+    templates_svc.seed_starters(db, user)
+    db.commit()
+    # Cap=3 so delete one before adding a non-starter to flag-default.
+    rows = templates_svc.templates_repo.list_for_user(db, user.id)
+    templates_svc.delete(db, user, rows[-1].id)
+    db.commit()
+    # Create a non-starter and mark it default — should override the
+    # starter that was previously the default.
+    t = templates_svc.create(
+        db, user, name="My Pick", subject="Subj", body="Body"
+    )
+    db.commit()
+    templates_svc.templates_repo.set_default(
+        db, user_id=user.id, template_id=t.id
+    )
+    db.commit()
+    picked = templates_svc.templates_repo.default_for_user(db, user.id)
+    assert picked is not None
+    assert picked.id == t.id
+    # And no other template still has is_default=true.
+    all_rows = templates_svc.templates_repo.list_for_user(db, user.id)
+    assert sum(1 for r in all_rows if r.is_default) == 1
+
+
+def test_set_default_returns_none_for_other_users_template(db: Session) -> None:
+    """Single-default invariant must be ownership-scoped."""
+    user_a = _make_user(db, email="a@x.com", google_sub="g-a", tier="free")
+    user_b = _make_user(db, email="b@x.com", google_sub="g-b", tier="free")
+    templates_svc.seed_starters(db, user_a)
+    templates_svc.seed_starters(db, user_b)
+    db.commit()
+    a_template = templates_svc.templates_repo.list_for_user(db, user_a.id)[0]
+
+    # User B tries to set User A's template as default → None.
+    result = templates_svc.templates_repo.set_default(
+        db, user_id=user_b.id, template_id=a_template.id
+    )
+    assert result is None
+    # And user A's default is unchanged.
+    a_default = templates_svc.templates_repo.default_for_user(db, user_a.id)
+    assert a_default is not None
+    assert a_default.id == a_template.id
+
+
+def test_set_default_is_atomic_unsets_other_defaults(db: Session) -> None:
+    """Manually flipping two templates to is_default=true (e.g. from an
+    older migration) is corrected on the next set_default call."""
+    from sqlalchemy import update
+
+    from app.models import Template
+
+    user = _make_user(db, email="u@x.com", tier="free")
+    templates_svc.seed_starters(db, user)
+    db.commit()
+    rows = templates_svc.templates_repo.list_for_user(db, user.id)
+
+    # Corrupt the state: flip ALL three to is_default=true.
+    db.execute(
+        update(Template)
+        .where(Template.user_id == user.id)
+        .values(is_default=True)
+    )
+    db.commit()
+    assert sum(1 for r in rows if db.get(Template, r.id).is_default) == 3  # type: ignore[union-attr]
+
+    # set_default on one row should reset the other two.
+    templates_svc.templates_repo.set_default(
+        db, user_id=user.id, template_id=rows[1].id
+    )
+    db.commit()
+    db.expire_all()
+    fresh = templates_svc.templates_repo.list_for_user(db, user.id)
+    defaults = [r for r in fresh if r.is_default]
+    assert len(defaults) == 1
+    assert defaults[0].id == rows[1].id
+
+
 # ─────────────────────────── router (CRUD + cap + gating) ───────────────────────────
 
 
@@ -251,3 +350,63 @@ def test_create_validates_blank_and_oversize(db: Session, client_factory) -> Non
         "/api/v1/templates",
         json={"name": "n", "subject": "s", "body": "x" * 20_001},
     ).status_code == 422
+
+
+# ─────────────────────────── POST /{id}/default ───────────────────────────
+
+
+def test_set_default_endpoint_flips_the_flag(db: Session, client_factory) -> None:
+    user = _free_user(db)
+    templates_svc.seed_starters(db, user)
+    db.commit()
+    client = client_factory(user)
+    items = client.get("/api/v1/templates").json()["items"]
+    assert len(items) == 3
+    # Find a non-default starter and promote it.
+    non_default = next(t for t in items if not t["is_default"])
+    r = client.post(f"/api/v1/templates/{non_default['id']}/default")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_default"] is True
+    # Re-list — only the promoted one is now is_default.
+    rows = client.get("/api/v1/templates").json()["items"]
+    defaults = [t for t in rows if t["is_default"]]
+    assert len(defaults) == 1
+    assert defaults[0]["id"] == non_default["id"]
+
+
+def test_set_default_endpoint_404_for_other_users_template(
+    db: Session, client_factory
+) -> None:
+    owner = _make_user(db, email="owner@x.com", google_sub="g-o", tier="free")
+    t = Template(user_id=owner.id, name="O", subject="s", body="b")
+    db.add(t)
+    db.commit()
+
+    intruder = _make_user(db, email="intruder@x.com", google_sub="g-i", tier="free")
+    r = client_factory(intruder).post(f"/api/v1/templates/{t.id}/default")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+
+
+def test_set_default_endpoint_404_for_unknown_id(
+    db: Session, client_factory
+) -> None:
+    user = _free_user(db)
+    assert (
+        client_factory(user).post("/api/v1/templates/99999/default").status_code
+        == 404
+    )
+
+
+def test_set_default_endpoint_is_idempotent(db: Session, client_factory) -> None:
+    """Setting default on an already-default template still 200s."""
+    user = _free_user(db)
+    templates_svc.seed_starters(db, user)
+    db.commit()
+    client = client_factory(user)
+    items = client.get("/api/v1/templates").json()["items"]
+    already_default = next(t for t in items if t["is_default"])
+    r = client.post(f"/api/v1/templates/{already_default['id']}/default")
+    assert r.status_code == 200
+    assert r.json()["is_default"] is True
