@@ -139,10 +139,15 @@ def render_template(
 
 def seed_starters(db: OrmSession, user: User) -> int:
     """Create the 3 starter templates for a user IFF they have none yet.
-    Idempotent — safe to call on every login. Returns count created."""
+    Idempotent — safe to call on every login. Returns count created.
+
+    The FIRST starter is also flagged is_default=True so autopilot has an
+    explicit pick from day one — matches the legacy implicit-default
+    behaviour (the first inserted row was always the one autopilot used)
+    while making the choice visible + changeable from the UI."""
     if templates_repo.count_for_user(db, user.id) > 0:
         return 0
-    for spec in STARTER_TEMPLATES:
+    for idx, spec in enumerate(STARTER_TEMPLATES):
         templates_repo.add(
             db,
             Template(
@@ -151,6 +156,7 @@ def seed_starters(db: OrmSession, user: User) -> int:
                 subject=spec["subject"],
                 body=spec["body"],
                 is_starter=True,
+                is_default=(idx == 0),
             ),
         )
     log.info("templates.starters_seeded", user_id=user.id, count=len(STARTER_TEMPLATES))
