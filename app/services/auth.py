@@ -28,6 +28,7 @@ from app.models import Session as SessionRow
 from app.models import User
 from app.repositories import users as users_repo
 from app.repositories import waitlist as waitlist_repo
+from app.services import refresh_tokens as refresh_tokens_service
 from app.services import sessions as sessions_service
 from app.services.google_oauth import GoogleIdentity
 
@@ -140,9 +141,10 @@ def complete_google_login(
     *,
     user_agent: str | None,
     ip: str | None,
-) -> tuple[User, SessionRow, TierDecision]:
+) -> tuple[User, SessionRow, refresh_tokens_service.IssueResult, TierDecision]:
     """End-to-end OAuth callback orchestration. Returns the (user, session,
-    decision) tuple so the router can build the redirect URL.
+    refresh_token, decision) tuple so the router can build the redirect URL
+    AND set the HttpOnly refresh cookie.
 
     Owns the commit boundary."""
     user = _upsert_user(db, identity)
@@ -161,6 +163,15 @@ def complete_google_login(
 
         templates_svc.seed_starters(db, user)
 
-    session = sessions_service.issue(db, user_id=user.id, user_agent=user_agent, ip=ip)
+    # Two-token auth: short-lived access token (sessions row) + long-lived
+    # refresh token (refresh_tokens row, HttpOnly cookie). A LOGIN always starts
+    # a fresh refresh family (no family_id passed) so logging in on a new
+    # device does NOT invalidate the existing one — multi-device support.
+    session = sessions_service.issue(
+        db, user_id=user.id, user_agent=user_agent, ip=ip
+    )
+    refresh = refresh_tokens_service.issue(
+        db, user_id=user.id, user_agent=user_agent, ip=ip
+    )
     db.commit()
-    return user, session, decision
+    return user, session, refresh, decision

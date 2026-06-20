@@ -6,6 +6,7 @@ from app.models.email_failure import EmailFailure
 from app.models.email_log import EmailLog
 from app.models.global_lock import GlobalContactLock
 from app.models.platform_company_lock import PlatformCompanyLock
+from app.models.refresh_token import RefreshToken
 from app.models.send_queue import SendQueue
 from app.models.session import Session
 from app.models.template import Template
@@ -26,6 +27,7 @@ __all__ = [
     "EmailLog",
     "GlobalContactLock",
     "PlatformCompanyLock",
+    "RefreshToken",
     "SendQueue",
     "Session",
     "Template",
