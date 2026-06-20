@@ -507,6 +507,73 @@ def test_apply_template_cross_user_404(
     assert r.status_code == 404
 
 
+def test_apply_template_restamps_late_cards_so_scheduler_does_not_blast(
+    client_factory, db: Session, free_user: User
+) -> None:
+    """Regression: apply-template promotes default→ready. If it leaves the
+    card's send_time in the past, the next scheduler drain pulls every
+    past-due ready row in a single tick and blasts them all (the user-reported
+    "selected a template and it sent all my emails in one go" bug).
+
+    Fix: apply-template must restamp the cards it promotes to ready at the
+    tier's cadence, same as /send-batch and PATCH /items already do.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from app.core.time import ensure_utc, utcnow
+    from app.models import TodayBatchItem
+
+    _seed_pool(db, n=3)
+    batch_gen_svc.generate_batch_for_user(
+        db, free_user, batch_date=utcnow().date(), rng=Random(1)
+    )
+    # Backdate every card so each is now LATE — simulates the user opening
+    # /today late in the day and applying a template to past-slot cards.
+    now = utcnow()
+    cards = list(
+        db.scalars(
+            select(TodayBatchItem).where(TodayBatchItem.user_id == free_user.id)
+        ).all()
+    )
+    assert len(cards) >= 3, "fixture should seed at least 3 cards"
+    for c in cards:
+        c.send_time = now - timedelta(hours=2)
+        db.add(c)
+    db.commit()
+
+    tmpl = _seed_user_template(db, free_user, name="Cool Opener")
+    client = client_factory(free_user)
+    r = client.post("/api/v1/today/apply-template", json={"template_id": tmpl.id})
+    assert r.status_code == 200, r.text
+
+    # After the fix, NO 'ready' card should still have a past send_time —
+    # they've been restamped to the back of the schedule at the tier cadence.
+    after = list(
+        db.scalars(
+            select(TodayBatchItem).where(
+                TodayBatchItem.user_id == free_user.id,
+                TodayBatchItem.status == "ready",
+            )
+        ).all()
+    )
+    assert len(after) >= 1
+    for item in after:
+        assert ensure_utc(item.send_time) > now, (
+            f"card {item.id} promoted to 'ready' but send_time {item.send_time} "
+            f"is still in the past — scheduler would blast it"
+        )
+
+    # Slots are spaced (free tier: 1/hour). Earliest restamped slot should be
+    # at least one full cadence away from `now`, never instantly due.
+    earliest = min(ensure_utc(i.send_time) for i in after)
+    assert earliest >= now + timedelta(minutes=30), (
+        f"earliest restamped slot {earliest} is too close to now — scheduler "
+        f"could still pick it up on the very next tick"
+    )
+
+
 def test_template_swap_clears_edited_at(
     client_factory, db: Session, free_user: User
 ) -> None:

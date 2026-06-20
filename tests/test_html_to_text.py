@@ -16,11 +16,26 @@ def test_plain_text_is_untouched() -> None:
     assert html_to_text(body) == body
 
 
-def test_paragraphs_become_blank_line_separated() -> None:
+def test_consecutive_paragraphs_stack_tight() -> None:
+    # Tiptap emits one `<p>` per Enter. The editor's preview shows consecutive
+    # paragraphs tightly stacked (no visible blank line). The flattener must
+    # match that so the body looks the same when loaded back into a textarea
+    # (e.g. /today card editor) — the previous behaviour doubled every line
+    # break and made each Tiptap paragraph look like a blank-line-separated
+    # block.
     html = "<p>Hi Alex,</p><p>I'm a student interested in Acme.</p><p>Best, Mridul</p>"
     out = html_to_text(html)
     assert "<p>" not in out and "</p>" not in out
-    assert out == "Hi Alex,\n\nI'm a student interested in Acme.\n\nBest, Mridul"
+    assert out == "Hi Alex,\nI'm a student interested in Acme.\nBest, Mridul"
+
+
+def test_explicit_empty_paragraph_creates_blank_line() -> None:
+    # The user's way to express "I want a blank line here" in Tiptap is to
+    # press Enter on an empty line — Tiptap encodes that as an empty `<p></p>`
+    # between content paragraphs. Two consecutive `</p>` closes therefore
+    # produce two newlines == one visible blank line.
+    html = "<p>Hi Alex,</p><p></p><p>I'm a student.</p>"
+    assert html_to_text(html) == "Hi Alex,\n\nI'm a student."
 
 
 def test_br_becomes_newline() -> None:
