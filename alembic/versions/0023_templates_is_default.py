@@ -38,17 +38,21 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("templates") as batch:
-        batch.add_column(
-            sa.Column(
-                "is_default",
-                sa.Boolean(),
-                nullable=False,
-                server_default=sa.false(),
-            )
-        )
+    # Plain ADD COLUMN (no batch_alter_table) — libsql/SQLite supports
+    # in-place ALTER TABLE ADD COLUMN for nullable / defaulted columns,
+    # which is what we want. batch_alter_table would do a destructive
+    # table recreate and that trips the self-referential FK on
+    # parent_template_id (Hrana: "FOREIGN KEY constraint failed").
+    op.add_column(
+        "templates",
+        sa.Column(
+            "is_default",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
+        ),
+    )
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("templates") as batch:
-        batch.drop_column("is_default")
+    op.drop_column("templates", "is_default")
