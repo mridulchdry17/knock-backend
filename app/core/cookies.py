@@ -83,4 +83,14 @@ def set_refresh_token_cookie(resp: Response, raw_token: str) -> None:
 
 
 def clear_refresh_token_cookie(resp: Response) -> None:
-    resp.delete_cookie(key=REFRESH_TOKEN_COOKIE, domain=_domain(), path="/")
+    # Mirror the attributes used at set time. Safari (and some older Edge
+    # builds) will ignore deletions whose attributes don't match the set —
+    # passing Secure / SameSite / HttpOnly explicitly is defensive but free.
+    resp.delete_cookie(
+        key=REFRESH_TOKEN_COOKIE,
+        domain=_domain(),
+        path="/",
+        secure=settings.COOKIE_SECURE,
+        httponly=True,
+        samesite="lax",
+    )

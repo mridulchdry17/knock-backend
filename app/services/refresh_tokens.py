@@ -23,10 +23,21 @@ from datetime import timedelta
 from sqlalchemy.orm import Session as OrmSession
 
 from app.config import settings
-from app.core.time import utcnow
+from app.core.time import ensure_utc, utcnow
 from app.logging_config import get_logger
 from app.models import RefreshToken
 from app.repositories import refresh_tokens as refresh_tokens_repo
+
+# Network-retry grace: if a token whose `replaced_by_id` is set is presented
+# again WITHIN this window after the rotation, treat it as a network retry
+# (the legitimate client's first refresh response was lost in flight) and
+# return the existing successor. Outside the window, treat as reuse and burn
+# the family.
+#
+# 30 seconds is generous enough for any reasonable TCP retransmit on mobile
+# networks while still being tight enough that a stolen-cookie replay is
+# almost certainly past the window by the time an attacker uses it.
+_NETWORK_RETRY_GRACE = timedelta(seconds=30)
 
 log = get_logger("refresh_tokens")
 
@@ -117,51 +128,117 @@ def validate_and_rotate(
     Cases:
       A. Row not found / expired past TTL / revoked-with-no-successor →
          INVALID (caller: 401, clear cookie).
-      B. Row was already rotated (replaced_by_id set) AND someone is
-         presenting it again → REUSE DETECTED. Revoke the whole family.
-      C. Row is active (not revoked, not expired, no successor) → ROTATE.
-         Mint a new row in the same family, link old → new via
-         replaced_by_id, mark old revoked.
+      B. Row was already rotated (replaced_by_id set) AND within the network-
+         retry grace window → RETURN THE EXISTING SUCCESSOR. This handles the
+         legitimate-client failure mode where the response to the first
+         refresh was lost in flight; the client retries with the same cookie,
+         and we hand back the same successor instead of burning everything.
+      C. Row was already rotated AND past the grace window → REUSE DETECTED.
+         Revoke the whole family.
+      D. Row is active → atomic CAS rotation via claim_for_rotation. If we
+         win, insert the new row and return it. If we lose to a concurrent
+         caller, fall through to case B (which now picks up the successor
+         the winner inserted).
 
-    No commit here; caller owns the transaction.
+    No commit inside the lock-claim path; caller owns the transaction.
     """
     row = refresh_tokens_repo.get(db, raw_token)
     if row is None:
         return ValidateResult(invalid=True)
 
-    # Reuse detection — present a token that was already swapped out.
-    # The legitimate client already moved on to the successor; whoever is
-    # holding this is either (a) a stolen copy being replayed, or (b) the
-    # legitimate client retrying after a network failure between us setting
-    # the new cookie and the client receiving it. Both are indistinguishable
-    # without more state, so we conservatively burn the whole family. Net
-    # cost in case (b): one re-login. Net cost in case (a): an attacker
-    # session is killed.
+    # Case B/C: token has already been rotated. Decide between network-retry
+    # grace and reuse-detection based on how long ago the rotation happened.
     if row.replaced_by_id is not None:
-        revoked_count = refresh_tokens_repo.revoke_family(db, row.family_id)
-        log.warning(
-            "refresh.reuse_detected",
-            user_id=row.user_id,
-            family_id=row.family_id,
-            revoked_rows=revoked_count,
-        )
-        return ValidateResult(reuse_detected=True, user_id=row.user_id)
+        return _handle_already_rotated(db, row)
 
     if not refresh_tokens_repo.is_active(row):
-        # Revoked (logout) or expired past TTL. Quiet 401, no family blast.
+        # Revoked (logout) or expired past TTL with no successor. Quiet 401.
         return ValidateResult(invalid=True)
 
-    # Happy path — rotate. New token continues the same family.
-    new = issue(
-        db,
+    # Case D: claim the rotation atomically. Pre-generate the successor's
+    # raw_token so we can fold it into the UPDATE without a follow-up read.
+    new_raw_token = _generate_token()
+    won_race = refresh_tokens_repo.claim_for_rotation(
+        db, raw_token=raw_token, new_token_id=new_raw_token
+    )
+
+    if not won_race:
+        # Concurrent rotation got there first. Re-read the row to find their
+        # successor, and return it as our result so the client ends up with
+        # the same successor cookie regardless of which call won.
+        db.expire(row)
+        return _handle_already_rotated(db, refresh_tokens_repo.get(db, raw_token))
+
+    # We won — persist the successor row and return it.
+    expires = utcnow() + timedelta(days=settings.REFRESH_TOKEN_TTL_DAYS)
+    successor_row = RefreshToken(
+        id=new_raw_token,
         user_id=row.user_id,
         family_id=row.family_id,
+        expires_at=expires,
         user_agent=user_agent,
         ip=ip,
     )
-    refresh_tokens_repo.revoke(db, row, replaced_by_id=new.raw_token)
+    refresh_tokens_repo.add(db, successor_row)
     log.info("refresh.rotated", user_id=row.user_id, family_id=row.family_id)
-    return ValidateResult(rotated=new, user_id=row.user_id)
+    return ValidateResult(
+        rotated=IssueResult(
+            raw_token=new_raw_token,
+            family_id=row.family_id,
+            expires_at_iso=expires.isoformat(),
+        ),
+        user_id=row.user_id,
+    )
+
+
+def _handle_already_rotated(
+    db: OrmSession, row: RefreshToken | None
+) -> ValidateResult:
+    """Shared logic for case B (network-retry grace) and case C (reuse)."""
+    if row is None or row.replaced_by_id is None:
+        # Race + expire_all means we may not see the rotation any more, OR
+        # the row was nuked by a family-revoke between our two reads. Either
+        # way: invalid, no family blast.
+        return ValidateResult(invalid=True)
+
+    rotated_at = ensure_utc(row.revoked_at) if row.revoked_at else None
+    successor = refresh_tokens_repo.get(db, row.replaced_by_id)
+
+    within_grace = (
+        rotated_at is not None
+        and (utcnow() - rotated_at) <= _NETWORK_RETRY_GRACE
+        and successor is not None
+        and refresh_tokens_repo.is_active(successor)
+    )
+    if within_grace:
+        # Network-retry: hand back the existing successor without burning
+        # anything. The client ends up with the same cookie they would have
+        # had on the first (lost-in-flight) response.
+        log.info(
+            "refresh.network_retry_replay",
+            user_id=row.user_id,
+            family_id=row.family_id,
+        )
+        # successor is guaranteed non-None inside `within_grace`.
+        assert successor is not None
+        return ValidateResult(
+            rotated=IssueResult(
+                raw_token=successor.id,
+                family_id=successor.family_id,
+                expires_at_iso=ensure_utc(successor.expires_at).isoformat(),
+            ),
+            user_id=row.user_id,
+        )
+
+    # Past grace window or successor already invalidated → genuine reuse.
+    revoked_count = refresh_tokens_repo.revoke_family(db, row.family_id)
+    log.warning(
+        "refresh.reuse_detected",
+        user_id=row.user_id,
+        family_id=row.family_id,
+        revoked_rows=revoked_count,
+    )
+    return ValidateResult(reuse_detected=True, user_id=row.user_id)
 
 
 def revoke_family_for_token(db: OrmSession, raw_token: str) -> int:

@@ -22,7 +22,7 @@ from __future__ import annotations
 from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Cookie, Query, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.config import settings
 from app.core.cookies import (
@@ -38,7 +38,6 @@ from app.core.cookies import (
 )
 from app.core.crypto import decrypt_optional
 from app.core.deps import CurrentSessionToken, CurrentUser, DbDep
-from app.core.errors import ApiError
 from app.repositories import refresh_tokens as refresh_tokens_repo
 from app.repositories import sessions as sessions_repo
 from app.schemas.auth import MeOut, RefreshOut
@@ -152,13 +151,25 @@ def me(user: CurrentUser) -> MeOut:
     )
 
 
+def _refresh_401(code: str) -> JSONResponse:
+    """Manual 401 response so we can attach a `Set-Cookie: refresh_token=;`
+    delete header. Raising ApiError instead would discard the cookie clear
+    because the ApiError handler builds a fresh JSONResponse from scratch."""
+    resp = JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"error": {"code": code, "message": "Session expired."}},
+    )
+    clear_refresh_token_cookie(resp)
+    return resp
+
+
 @api.post("/refresh", response_model=RefreshOut)
 def refresh(
     request: Request,
     response: Response,
     db: DbDep,
     refresh_token_cookie: str | None = Cookie(default=None, alias=REFRESH_TOKEN_COOKIE),
-) -> RefreshOut:
+) -> RefreshOut | JSONResponse:
     """Silent re-issuance. Validates the HttpOnly refresh cookie, rotates it
     (mints a new refresh token in the same family + revokes the presented
     one), and issues a fresh short-lived access token.
@@ -168,16 +179,14 @@ def refresh(
 
     Returns 401 on:
       - missing cookie
-      - expired or already-revoked token (gentle: clear cookie + 401)
-      - reuse detected (loud: family revoked + 401; both legit device and
-        attacker lose access until next interactive login)
+      - expired or already-revoked token (clears cookie + 401)
+      - reuse detected (clears cookie + 401; family revoked server-side)
+    All 401 paths return JSONResponse directly so the Set-Cookie clear lands
+    on the response (the global ApiError handler would discard mutations
+    made to the injected Response).
     """
     if not refresh_token_cookie:
-        raise ApiError(
-            "no_refresh_token",
-            "Not authenticated.",
-            status_code=status.HTTP_401_UNAUTHORIZED,
-        )
+        return _refresh_401("no_refresh_token")
 
     result = refresh_tokens_service.validate_and_rotate(
         db,
@@ -187,12 +196,9 @@ def refresh(
     )
 
     if result.invalid or result.reuse_detected:
-        # Clear the dead cookie so the browser stops sending it on every API
-        # call. 401 lets the frontend route the user back to the login screen.
-        clear_refresh_token_cookie(response)
-        db.commit()  # the family-revocation write needs to land
+        db.commit()  # family-revocation write (for reuse) must land
         code = "refresh_reuse_detected" if result.reuse_detected else "refresh_invalid"
-        raise ApiError(code, "Session expired.", status_code=status.HTTP_401_UNAUTHORIZED)
+        return _refresh_401(code)
 
     assert result.rotated is not None  # guaranteed by the validate contract
 
@@ -239,6 +245,12 @@ def disconnect(user: CurrentUser, db: DbDep, response: Response) -> Ok:
     if google_refresh_token:
         revoke_refresh_token(google_refresh_token)
 
+    # Merge into the request's session so we can safely mutate. The
+    # get_current_user dep may have loaded `user` against a session it has
+    # already closed (or, in tests, against a different session entirely),
+    # so a naked `db.add(user)` would raise "already attached" or "detached".
+    # Same pattern that complete_google_login uses.
+    user = db.merge(user, load=False)
     user.google_refresh_token = None
     user.google_access_token = None
     user.google_token_expiry = None

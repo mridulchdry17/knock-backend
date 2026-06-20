@@ -9,6 +9,39 @@ from app.core.time import ensure_utc, utcnow
 from app.models import RefreshToken
 
 
+def claim_for_rotation(
+    db: OrmSession,
+    *,
+    raw_token: str,
+    new_token_id: str,
+) -> bool:
+    """Atomically mark a token as rotated. Returns True iff the row was
+    matched and updated (rowcount == 1) — i.e. WE won the race and own the
+    rotation. Returns False when a concurrent rotation got there first
+    (rowcount == 0).
+
+    The single UPDATE statement is the critical section: it only succeeds
+    against a row that is still un-revoked and un-replaced. libsql/SQLite
+    atomicity per statement is sufficient — we never have to hold a lock
+    across multiple round-trips.
+
+    Expiry isn't included in the WHERE clause because libsql strips tzinfo
+    on storage (so the stored expires_at is naive while utcnow() is aware,
+    and SQLAlchemy's evaluator can't compare them). Callers gate on
+    `is_active(row)` before claim, which does the expiry check with
+    `ensure_utc()`. The race window between is_active and the UPDATE is
+    sub-millisecond; if a row expires in that window we'd rotate a hair
+    late, but the new row gets a fresh 30-day TTL so no harm done."""
+    result = db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.id == raw_token)
+        .where(RefreshToken.replaced_by_id.is_(None))
+        .where(RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow(), replaced_by_id=new_token_id)
+    )
+    return int(result.rowcount or 0) == 1
+
+
 def get(db: OrmSession, token: str) -> RefreshToken | None:
     """Return the row regardless of revoked/expired state — callers need
     to distinguish 'never existed' (None) from 'was valid, now revoked'

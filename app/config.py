@@ -58,13 +58,10 @@ class Settings(BaseSettings):
     # platform-wide cohort hold (any user → blocks everyone) and the 2-day
     # post-reply user lock.
     USER_CONTACT_COOLDOWN_DAYS: int = 30
-    # Two-token auth (migration 0022). The `sessions` row is now the SHORT-
-    # lived access token; SESSION_TTL_DAYS=30 was the v0 single-token TTL but
-    # we keep the same column for backwards compatibility. The frontend never
-    # holds the access token in persistent storage — it lives in memory only,
-    # so the 15-minute TTL bounds the XSS exfil window. The long-lived state
-    # lives in refresh_tokens (HttpOnly cookie, REFRESH_TOKEN_TTL_DAYS).
-    SESSION_TTL_DAYS: int = 30  # legacy alias; effective TTL is the minutes below
+    # Two-token auth (migration 0022). The `sessions` row is the SHORT-lived
+    # access token (in-memory on the client; ~15 min TTL bounds XSS exfil).
+    # The LONG-lived state lives in `refresh_tokens` as an HttpOnly cookie —
+    # JS can never read it, so 30 days is safe.
     ACCESS_TOKEN_TTL_MINUTES: int = 15
     REFRESH_TOKEN_TTL_DAYS: int = 30
 
