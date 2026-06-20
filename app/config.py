@@ -58,7 +58,15 @@ class Settings(BaseSettings):
     # platform-wide cohort hold (any user → blocks everyone) and the 2-day
     # post-reply user lock.
     USER_CONTACT_COOLDOWN_DAYS: int = 30
-    SESSION_TTL_DAYS: int = 30
+    # Two-token auth (migration 0022). The `sessions` row is now the SHORT-
+    # lived access token; SESSION_TTL_DAYS=30 was the v0 single-token TTL but
+    # we keep the same column for backwards compatibility. The frontend never
+    # holds the access token in persistent storage — it lives in memory only,
+    # so the 15-minute TTL bounds the XSS exfil window. The long-lived state
+    # lives in refresh_tokens (HttpOnly cookie, REFRESH_TOKEN_TTL_DAYS).
+    SESSION_TTL_DAYS: int = 30  # legacy alias; effective TTL is the minutes below
+    ACCESS_TOKEN_TTL_MINUTES: int = 15
+    REFRESH_TOKEN_TTL_DAYS: int = 30
 
     LOG_LEVEL: str = "INFO"
     # Master switch for the in-process autopilot scheduler (APScheduler). OFF by

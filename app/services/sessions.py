@@ -26,10 +26,17 @@ def issue(
     user_agent: str | None = None,
     ip: str | None = None,
 ) -> SessionRow:
+    """Mint the short-lived access token (= sessions row).
+
+    TTL is `ACCESS_TOKEN_TTL_MINUTES` (15 min by default). The browser holds
+    this in memory only; when it expires, the frontend silent-refreshes via
+    the HttpOnly refresh cookie to mint a new one. See
+    `app.services.refresh_tokens` for the long-lived half.
+    """
     row = SessionRow(
         id=secrets.token_urlsafe(_TOKEN_BYTES),
         user_id=user_id,
-        expires_at=utcnow() + timedelta(days=settings.SESSION_TTL_DAYS),
+        expires_at=utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_TTL_MINUTES),
         user_agent=user_agent,
         ip=ip,
     )
