@@ -35,6 +35,8 @@ from app.schemas.admin import (
     AdminUserOut,
     AdminWaitlistOut,
     ApproveWaitlistIn,
+    BulkApproveWaitlistIn,
+    BulkApproveWaitlistOut,
     CompanySummaryOut,
     ContactUploadIn,
     ContactUploadResultOut,
@@ -139,13 +141,37 @@ def unsuspend_user(_admin: SuperAdminUser, db: DbDep, user_id: int) -> AdminUser
 # ─────────────────────────── waitlist ───────────────────────────
 
 
+_STATUS_LITERALS = ("pending", "approved", "all")
+_SORT_LITERALS = ("newest", "oldest")
+
+
 @router.get("/waitlist", response_model=Page[AdminWaitlistOut])
 def list_waitlist(
     _admin: SuperAdminUser,
     db: DbDep,
     page: Annotated[PaginationParams, Depends(pagination)],
+    search: Annotated[str | None, Query(max_length=255)] = None,
+    status_filter: Annotated[str, Query(alias="status")] = "pending",
+    sort: Annotated[str, Query()] = "newest",
 ) -> Page[AdminWaitlistOut]:
-    rows, total = waitlist_repo.list_paginated(db, limit=page.limit, offset=page.offset)
+    """List waitlist entries with optional search + status + sort filters.
+
+    `status` defaults to `pending` (the action queue — that's almost always
+    what admin wants by default). `?status=approved` / `?status=all` flip
+    the filter; anything else falls back to `all` so a typo doesn't crash."""
+    if status_filter not in _STATUS_LITERALS:
+        status_filter = "all"
+    if sort not in _SORT_LITERALS:
+        sort = "newest"
+
+    rows, total = waitlist_repo.list_paginated(
+        db,
+        limit=page.limit,
+        offset=page.offset,
+        search=search,
+        status_filter=status_filter,
+        sort=sort,
+    )
     return Page(
         items=[AdminWaitlistOut.model_validate(r) for r in rows],
         total=total,
@@ -263,6 +289,52 @@ def revoke_waitlist_entry(
     and if a 'free'/'paid' account was linked to this entry, parks it back at
     'pending'. super_admin tier untouched."""
     return _set_waitlist_approval(db, entry_id, approved=False)
+
+
+@router.post("/waitlist/approve-bulk", response_model=BulkApproveWaitlistOut)
+def bulk_approve_waitlist(
+    _admin: SuperAdminUser,
+    db: DbDep,
+    payload: BulkApproveWaitlistIn,
+) -> BulkApproveWaitlistOut:
+    """Approve N waitlist entries in one round-trip.
+
+    Reuses `_set_waitlist_approval` per id so the linked-account tier sync
+    behaviour is identical to the per-row endpoint. Idempotent — already-
+    approved rows are counted but not re-stamped (no tier reset, no churn).
+    Not-found ids are returned in the response so the caller can show the
+    user which selections were stale.
+    """
+    if not payload.ids:
+        return BulkApproveWaitlistOut(
+            newly_approved=0, already_approved=0, not_found_ids=[]
+        )
+
+    newly_approved = 0
+    already_approved = 0
+    not_found: list[int] = []
+
+    for entry_id in payload.ids:
+        entry = waitlist_repo.get(db, entry_id)
+        if entry is None:
+            not_found.append(entry_id)
+            continue
+        if entry.approved_at is not None:
+            already_approved += 1
+            continue
+        # Defer to the existing helper so account-sync side-effects (promote
+        # any linked user from pending → free/paid) fire per-row exactly as
+        # they do via the single-row endpoint.
+        _set_waitlist_approval(
+            db, entry_id, approved=True, intended_tier=payload.tier
+        )
+        newly_approved += 1
+
+    return BulkApproveWaitlistOut(
+        newly_approved=newly_approved,
+        already_approved=already_approved,
+        not_found_ids=not_found,
+    )
 
 
 # ─────────────────────────── contacts (B5.1) ───────────────────────────
