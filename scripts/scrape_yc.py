@@ -76,34 +76,46 @@ def _batch_short(batch_full: str) -> str:
 # ── step 1: Algolia → company slugs ─────────────────────────────────────────
 
 def fetch_all_slugs() -> list[dict]:
-    """Return list of {slug, name, website, batch} for all target batches."""
+    """Return list of {slug, name, website, batch} for all target batches.
+
+    Queries each batch separately to bypass Algolia's 1000-result hard cap.
+    Deduplicates by slug in case a company appears in multiple batches.
+    """
     headers = {
         "X-Algolia-Application-Id": ALGOLIA_APP_ID,
         "X-Algolia-API-Key": ALGOLIA_API_KEY,
         "Content-Type": "application/json",
     }
-    batch_filter = [f"batch:{b}" for b in TARGET_BATCHES]  # OR within inner list
-    page, hits_per_page = 0, 200
     results = []
+    seen_slugs: set[str] = set()
 
-    while True:
-        payload = {
-            "query": "",
-            "facetFilters": [batch_filter],
-            "hitsPerPage": hits_per_page,
-            "page": page,
-            "attributesToRetrieve": ["name", "slug", "website", "batch", "status"],
-        }
-        resp = requests.post(ALGOLIA_URL, headers=headers, json=payload, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        hits = data.get("hits", [])
-        results.extend(hits)
-        nb_pages = data.get("nbPages", 1)
-        print(f"  Algolia page {page+1}/{nb_pages}: {len(hits)} companies")
-        if page + 1 >= nb_pages:
-            break
-        page += 1
+    for batch in TARGET_BATCHES:
+        page = 0
+        batch_count = 0
+        while True:
+            payload = {
+                "query": "",
+                "facetFilters": [f"batch:{batch}"],
+                "hitsPerPage": 200,
+                "page": page,
+                "attributesToRetrieve": ["name", "slug", "website", "batch", "status"],
+            }
+            resp = requests.post(ALGOLIA_URL, headers=headers, json=payload, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            hits = data.get("hits", [])
+            nb_pages = data.get("nbPages", 1)
+            for h in hits:
+                slug = h.get("slug", "")
+                if slug and slug not in seen_slugs:
+                    seen_slugs.add(slug)
+                    results.append(h)
+                    batch_count += 1
+            print(f"  [{batch}] page {page+1}/{nb_pages}: {len(hits)} hits")
+            if page + 1 >= nb_pages:
+                break
+            page += 1
+        print(f"  [{batch}] subtotal: {batch_count} companies")
 
     print(f"  Total from Algolia: {len(results)} companies")
     return results
@@ -284,12 +296,15 @@ def main() -> int:
             )
             companies_existing += 1
         else:
+            # INSERT OR IGNORE handles the rare case where two Algolia hits share a domain
             conn.execute(
-                "INSERT INTO companies (name, domain, source, batch, created_at)"
+                "INSERT OR IGNORE INTO companies (name, domain, source, batch, created_at)"
                 " VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
                 (name, domain, SOURCE_TAG, batch_short),
             )
             row = conn.execute("SELECT id FROM companies WHERE domain = ?", (domain,)).fetchone()
+            if not row:
+                continue
             company_id = row[0]
             companies_created += 1
 
