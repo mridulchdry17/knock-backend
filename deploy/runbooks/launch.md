@@ -91,6 +91,63 @@ or the EnvironmentFile path; check `journalctl -u knock-api`.
 
 ---
 
+## Enabling the autopilot scheduler
+
+Until this flag is flipped, the API is fully functional for manual review but
+autopilot is dormant: no batches are generated at 6 am, no queued sends drain,
+no replies are ingested. Real autopilot users see a permanently empty `/today`
+and missing replies. **Flip this as part of the launch ceremony, not before.**
+
+Single-worker guarantee: the systemd unit's `ExecStart` runs `uvicorn` with no
+`--workers` flag (default = 1). If you ever change that, this scheduler must
+move to systemd timers — see the SINGLE-WORKER caveat in
+`app/jobs/scheduler.py`.
+
+### 1. Edit `.env` on the VM
+```bash
+cd /home/azureuser/outreach-backend
+nano .env
+# change:
+#   RUN_SCHEDULER=0
+# to:
+#   RUN_SCHEDULER=1
+```
+Defaults you can leave alone:
+- `AUTOPILOT_CYCLE_INTERVAL_MINUTES=30` — how often the cycle fires.
+
+### 2. Restart the service
+```bash
+sudo systemctl restart knock-api
+sudo journalctl -u knock-api --since "1 minute ago" | grep scheduler
+```
+Expect a line: `scheduler.started   interval_minutes=30`.
+If you see `scheduler.disabled` instead, the env var didn't take — check
+that nano saved and `EnvironmentFile` resolves to the file you edited.
+
+### 3. Watch the first cycle land
+The cycle fires once shortly after startup (misfire grace = 5 min) and then
+every 30 minutes. Watch one go by:
+```bash
+sudo journalctl -u knock-api -f | grep scheduler
+```
+Expect `scheduler.cycle_ok` with counts of batch_users, sent, replies_matched, etc.
+
+### 4. Close NSG port 8000 (security gap from the manual-uvicorn era)
+The manually-running uvicorn used to bind 0.0.0.0:8000; we kept the NSG rule
+open from that era. systemd uvicorn binds 127.0.0.1 only — port 8000 should
+not be reachable from the public internet anymore.
+
+In Azure portal: VM → Networking → delete the inbound rule allowing :8000
+(keep :443 for Caddy and :22 for SSH).
+
+Verify externally:
+```bash
+curl -s -m 5 http://knock-api.koreacentral.cloudapp.azure.com:8000/healthz
+# expect: timeout or connection refused — NOT a {"status":"ok"} response.
+```
+
+---
+
 ## Routine deploys (after systemd is active)
 
 ```bash
