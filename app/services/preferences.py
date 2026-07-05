@@ -103,24 +103,37 @@ def remove_excluded_domain(db: OrmSession, user: User, domain: str) -> bool:
 def enable_autopilot(db: OrmSession, user: User) -> None:
     user.autopilot_enabled = True
     user.autopilot_paused_at = None  # enabling clears any prior pause
+    # Reset paused_reason too — the frontend uses this to render "paused
+    # because you hit N replies" style copy; stale reasons after a re-enable
+    # would confuse users.
+    user.autopilot_paused_reason = None
+    # Anchor stop-condition counters at each toggle-on. Every send/reply/day
+    # counter in autopilot_stop.should_pause is measured relative to this
+    # timestamp — bumping it here means a user who pauses (via any path) and
+    # re-enables gets a fresh window.
+    user.autopilot_enabled_at = utcnow()
     db.add(user)
     db.commit()
 
 
 def disable_autopilot(db: OrmSession, user: User) -> None:
     user.autopilot_enabled = False
-    # Leave autopilot_paused_at as-is — disable is not the same as resume.
+    # Leave autopilot_paused_at + autopilot_enabled_at as-is — disable is not
+    # the same as resume, and we want the enabled_at audit trail (the counter
+    # window it defines only matters while autopilot_enabled=True anyway).
     db.add(user)
     db.commit()
 
 
 def pause_autopilot(db: OrmSession, user: User) -> None:
     user.autopilot_paused_at = utcnow()
+    user.autopilot_paused_reason = "user"
     db.add(user)
     db.commit()
 
 
 def resume_autopilot(db: OrmSession, user: User) -> None:
     user.autopilot_paused_at = None
+    user.autopilot_paused_reason = None
     db.add(user)
     db.commit()
