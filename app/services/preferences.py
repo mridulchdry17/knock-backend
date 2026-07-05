@@ -74,10 +74,39 @@ def update_preferences(
     # are not in the dict, so update_user_preferences leaves them alone.
     # Explicit `null` survives and clears the column.
     data = patch.model_dump(exclude_unset=True)
+    data = _enforce_stop_condition_exclusivity(data)
     prefs_repo.update_user_preferences(db, user, data)
     db.commit()
     db.refresh(user)
     return build_preferences_out(user)
+
+
+# ─────────────────────────── stop-condition exclusivity ───────────────────────────
+
+_STOP_VALUE_COLUMNS: dict[str, str] = {
+    "replies": "autopilot_stop_at_replies",
+    "end_date": "autopilot_stop_at_date",
+    "budget": "autopilot_stop_at_budget",
+}
+
+
+def _enforce_stop_condition_exclusivity(data: dict[str, object]) -> dict[str, object]:
+    """Radio-group semantics: at most one value column populated at a time.
+
+    Runs on the outbound patch dict (before it reaches the repo). If the
+    payload sets `autopilot_stop_type`, all sibling value columns get NULL'd
+    server-side — the caller doesn't need to remember to clear them, and we
+    can never end up with two of the three set at once.
+
+    Special case for stop_type='none': all three value columns get NULL'd.
+    """
+    stop_type = data.get("autopilot_stop_type")
+    if stop_type is None:
+        return data  # untouched — no radio-group change in this patch
+    for kind, column in _STOP_VALUE_COLUMNS.items():
+        if kind != stop_type:
+            data[column] = None
+    return data
 
 
 def add_excluded_domain(db: OrmSession, user: User, domain: str) -> DomainResult:
