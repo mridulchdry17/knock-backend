@@ -126,5 +126,30 @@ def should_pause(
     if days >= CEILING_MAX_DAYS:
         return True, "ceiling_days"
 
-    # 2. User's chosen condition — dispatched in the follow-up commit.
+    # 2. User's chosen condition.
+    stop_type = user.autopilot_stop_type or "none"
+
+    if stop_type == "replies":
+        threshold = user.autopilot_stop_at_replies
+        if threshold is not None:
+            replies = _replies_since_enabled(user, db)
+            if replies >= threshold:
+                return True, "replies"
+
+    elif stop_type == "end_date":
+        # today() >= chosen date. Same-day fires (rather than only *after*)
+        # so a user who picks tomorrow gets exactly one more day of sends.
+        target = user.autopilot_stop_at_date
+        if target is not None and now.date() >= target:
+            return True, "end_date"
+
+    elif stop_type == "budget":
+        # Reuses the sends count already computed for the ceiling check —
+        # no extra query. Budget always <= ceiling (200 vs 500) so ordering
+        # naturally lets the ceiling win when both would fire on the same
+        # tick.
+        threshold = user.autopilot_stop_at_budget
+        if threshold is not None and sends >= threshold:
+            return True, "budget"
+
     return False, None
