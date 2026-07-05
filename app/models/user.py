@@ -74,6 +74,26 @@ class User(Base, TimestampMixin):
         Boolean, nullable=False, default=True
     )
 
+    # ─────────────── stop conditions (migration 0025) ───────────────
+    # Anchor for counter helpers and platform ceilings. Set on every
+    # toggle-on so counters reset; preserved on toggle-off for audit.
+    autopilot_enabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    # 'none' | 'replies' | 'end_date' | 'budget'. Radio-group semantics —
+    # only ONE of the value columns below is meaningful at a time; the
+    # preferences service nulls the siblings on stop_type change.
+    autopilot_stop_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none"
+    )
+    autopilot_stop_at_replies: Mapped[int | None] = mapped_column(Integer)
+    autopilot_stop_at_date: Mapped[date | None] = mapped_column(Date)
+    autopilot_stop_at_budget: Mapped[int | None] = mapped_column(Integer)
+    # Written by the autopilot cycle when a stop condition fires. Reads:
+    # 'user' | 'replies' | 'end_date' | 'budget' | 'ceiling_sends' |
+    # 'ceiling_days'. Cleared on resume.
+    autopilot_paused_reason: Mapped[str | None] = mapped_column(String(32))
+
     resume_url: Mapped[str | None] = mapped_column(String(2048))
 
     @property
