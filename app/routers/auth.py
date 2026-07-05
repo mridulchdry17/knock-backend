@@ -148,6 +148,10 @@ def me(user: CurrentUser) -> MeOut:
         has_gmail_connected=user.has_gmail_connected,
         daily_limit=user.daily_limit,
         sent_today=user.sent_today,
+        autopilot_enabled=user.autopilot_enabled,
+        autopilot_paused_at=user.autopilot_paused_at,
+        autopilot_paused_reason=user.autopilot_paused_reason,
+        autopilot_stop_type=user.autopilot_stop_type or "none",  # type: ignore[arg-type]
     )
 
 

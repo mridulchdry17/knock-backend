@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Literal
+
 from app.schemas.common import ORMModel
 
 
@@ -14,6 +17,14 @@ class MeOut(ORMModel):
     has_gmail_connected: bool
     daily_limit: int
     sent_today: int
+
+    # Autopilot summary. Enough for the top nav to render "autopilot on /
+    # paused because X" without a second /preferences roundtrip. Full
+    # editing surface remains on /preferences.
+    autopilot_enabled: bool = False
+    autopilot_paused_at: datetime | None = None
+    autopilot_paused_reason: str | None = None
+    autopilot_stop_type: Literal["none", "replies", "end_date", "budget"] = "none"
 
 
 class RefreshOut(ORMModel):
