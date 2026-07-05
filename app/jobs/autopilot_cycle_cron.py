@@ -18,13 +18,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session as OrmSession
+
 from app.core.time import utcnow
 from app.db.session import SessionLocal
 from app.logging_config import get_logger
-from app.services import batch_generator as batch_gen
+from app.models import User
+from app.services import autopilot_stop, batch_generator as batch_gen
 from app.services import followup_planner, reply_ingestor, send_worker
 
 log = get_logger("autopilot_cycle_cron")
+
+
+def _apply_stop_conditions(db: OrmSession) -> int:
+    """Pause autopilot for any user whose stop condition (or a platform
+    ceiling) fires. Runs BEFORE batch generation so paused users are skipped
+    by `_is_autopilot_active` and their batch is marked status='default'
+    (manual-review) rather than 'ready' (auto-send).
+
+    Returns the number of users paused this cycle.
+    """
+    now = utcnow()
+    autopilot_users = list(
+        db.scalars(
+            select(User)
+            .where(User.autopilot_enabled.is_(True))
+            .where(User.autopilot_paused_at.is_(None))
+        ).all()
+    )
+    paused = 0
+    for user in autopilot_users:
+        should_pause, reason = autopilot_stop.should_pause(user, db, now=now)
+        if not should_pause:
+            continue
+        user.autopilot_paused_at = now
+        user.autopilot_paused_reason = reason
+        db.add(user)
+        db.commit()
+        paused += 1
+        log.info(
+            "autopilot.stop_condition_triggered",
+            user_id=user.id,
+            reason=reason,
+        )
+    return paused
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +77,9 @@ class CycleResult:
     explicit_stops: int
     # New in 0018 — defaults to 0 so existing test constructors stay valid.
     followups_planned: int = 0
+    # New in 0025 — stop-condition sweep count. Defaults to 0 so existing
+    # test constructors that build CycleResult by hand stay valid.
+    autopilot_paused_by_stop_condition: int = 0
 
 
 def run_cycle() -> CycleResult:
@@ -46,6 +87,12 @@ def run_cycle() -> CycleResult:
     today = utcnow().date()
     db = SessionLocal()
     try:
+        # 0. Stop-condition sweep. Pauses autopilot for any user who's hit
+        #    their chosen condition or a platform ceiling. Must run BEFORE
+        #    batch gen so paused users' cards land as status='default'
+        #    (manual review) not 'ready' (auto-send).
+        stop_paused = _apply_stop_conditions(db)
+
         # 1. Batch generation (initials only).
         batch_results = batch_gen.generate_batch_for_all_users(db, batch_date=today)
         batch_users = len(batch_results)
@@ -77,6 +124,7 @@ def run_cycle() -> CycleResult:
             ingest_users_processed=len(ingest_summaries),
             replies_matched=replies,
             explicit_stops=stops,
+            autopilot_paused_by_stop_condition=stop_paused,
         )
         log.info(
             "autopilot_cycle.done",
@@ -87,6 +135,7 @@ def run_cycle() -> CycleResult:
             failed=drain.failed,
             replies_matched=replies,
             explicit_stops=stops,
+            autopilot_paused_by_stop_condition=stop_paused,
         )
         return result
     finally:
