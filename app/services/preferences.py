@@ -54,6 +54,12 @@ def build_preferences_out(user: User) -> PreferencesOut:
         autopilot_enabled=user.autopilot_enabled,
         autopilot_paused_at=user.autopilot_paused_at,
         autopilot_auto_pause_on_reply=user.autopilot_auto_pause_on_reply,
+        autopilot_enabled_at=user.autopilot_enabled_at,
+        autopilot_stop_type=user.autopilot_stop_type or "none",  # type: ignore[arg-type]
+        autopilot_stop_at_replies=user.autopilot_stop_at_replies,
+        autopilot_stop_at_date=user.autopilot_stop_at_date,
+        autopilot_stop_at_budget=user.autopilot_stop_at_budget,
+        autopilot_paused_reason=user.autopilot_paused_reason,
         resume_url=user.resume_url,
     )
 

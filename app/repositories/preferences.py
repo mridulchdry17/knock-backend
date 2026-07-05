@@ -27,6 +27,13 @@ _PATCHABLE_COLUMNS: frozenset[str] = frozenset(
         "notify_daily_summary",
         "autopilot_auto_pause_on_reply",
         "resume_url",
+        # Stop-condition fields (migration 0025). Exclusivity between the
+        # three value columns is enforced in app.services.preferences —
+        # this whitelist just permits the write at all.
+        "autopilot_stop_type",
+        "autopilot_stop_at_replies",
+        "autopilot_stop_at_date",
+        "autopilot_stop_at_budget",
     }
 )
 
