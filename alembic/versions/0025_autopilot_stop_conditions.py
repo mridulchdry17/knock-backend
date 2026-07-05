@@ -76,6 +76,35 @@ def upgrade() -> None:
         sa.Column("autopilot_paused_reason", sa.String(32), nullable=True),
     )
 
+    # ─────────────── data backfill ───────────────
+    # Every existing user with the old auto-pause-on-reply flag gets ported
+    # to the new model as stop_type='replies', stop_at_replies=1 (the closest
+    # equivalent — pause after the very first reply). Users without the flag
+    # remain on 'none' (the server_default). The old column is intentionally
+    # left in place for one release; new logic ignores it.
+    bind = op.get_bind()
+    bind.execute(
+        sa.text(
+            "UPDATE users "
+            "SET autopilot_stop_type = 'replies', "
+            "    autopilot_stop_at_replies = 1 "
+            "WHERE autopilot_auto_pause_on_reply = 1"
+        )
+    )
+    # Anchor existing autopilot users' counters to a best-guess epoch so
+    # freshly-migrated rows don't start at NULL and confuse the counter
+    # helpers. Prefer updated_at over created_at (more recent → less spurious
+    # backlog of sends attributed to autopilot). If neither exists (defensive:
+    # both are NOT NULL in this schema), the counter helpers treat NULL as zero.
+    bind.execute(
+        sa.text(
+            "UPDATE users "
+            "SET autopilot_enabled_at = COALESCE(updated_at, created_at) "
+            "WHERE autopilot_enabled = 1 "
+            "  AND autopilot_enabled_at IS NULL"
+        )
+    )
+
 
 def downgrade() -> None:
     op.drop_column("users", "autopilot_paused_reason")
