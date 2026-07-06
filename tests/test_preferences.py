@@ -6,6 +6,8 @@ session/bearer plumbing.
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from fastapi import Depends, status
 from fastapi.testclient import TestClient
@@ -15,6 +17,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from app.core.deps import get_current_user
 from app.core.errors import ApiError
+from app.core.time import utcnow
 from app.db.session import get_db
 from app.main import app
 from app.models import User
@@ -271,3 +274,149 @@ def test_resume_clears_auto_pause_history(client_factory, paid_user) -> None:
     body = r.json()
     assert body["autopilot_enabled"] is True
     assert body["autopilot_paused_at"] is None
+
+
+# ─────────────────────────── stop conditions ───────────────────────────
+
+
+def test_enable_autopilot_sets_enabled_at(client_factory, paid_user, db) -> None:
+    """Every toggle-on stamps autopilot_enabled_at so counters reset."""
+    client = client_factory(paid_user)
+    r = client.post("/api/v1/autopilot/enable")
+    assert r.status_code == 200
+    assert r.json()["autopilot_enabled_at"] is not None
+
+
+def test_disable_autopilot_preserves_enabled_at(client_factory, paid_user, db) -> None:
+    """Toggle-off keeps enabled_at for the audit trail."""
+    client = client_factory(paid_user)
+    client.post("/api/v1/autopilot/enable")
+    before = client.get("/api/v1/preferences").json()["autopilot_enabled_at"]
+    assert before is not None
+
+    r = client.post("/api/v1/autopilot/disable")
+    assert r.json()["autopilot_enabled_at"] == before
+
+
+def test_pause_stamps_reason_user(client_factory, paid_user) -> None:
+    client = client_factory(paid_user)
+    client.post("/api/v1/autopilot/enable")
+    client.post("/api/v1/autopilot/pause")
+    r = client.get("/api/v1/preferences")
+    assert r.json()["autopilot_paused_reason"] == "user"
+
+
+def test_resume_clears_paused_reason(client_factory, paid_user) -> None:
+    client = client_factory(paid_user)
+    client.post("/api/v1/autopilot/enable")
+    client.post("/api/v1/autopilot/pause")
+    client.post("/api/v1/autopilot/resume")
+    r = client.get("/api/v1/preferences")
+    assert r.json()["autopilot_paused_reason"] is None
+
+
+def test_patch_stop_type_replies_with_value(client_factory, free_user) -> None:
+    client = client_factory(free_user)
+    r = client.patch(
+        "/api/v1/preferences",
+        json={"autopilot_stop_type": "replies", "autopilot_stop_at_replies": 3},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["autopilot_stop_type"] == "replies"
+    assert body["autopilot_stop_at_replies"] == 3
+    assert body["autopilot_stop_at_date"] is None
+    assert body["autopilot_stop_at_budget"] is None
+
+
+def test_patch_stop_type_end_date_with_value(client_factory, free_user) -> None:
+    target = (utcnow().date() + timedelta(days=14)).isoformat()
+    client = client_factory(free_user)
+    r = client.patch(
+        "/api/v1/preferences",
+        json={"autopilot_stop_type": "end_date", "autopilot_stop_at_date": target},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["autopilot_stop_type"] == "end_date"
+    assert body["autopilot_stop_at_date"] == target
+
+
+def test_patch_stop_type_budget_with_value(client_factory, free_user) -> None:
+    client = client_factory(free_user)
+    r = client.patch(
+        "/api/v1/preferences",
+        json={"autopilot_stop_type": "budget", "autopilot_stop_at_budget": 50},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["autopilot_stop_type"] == "budget"
+    assert body["autopilot_stop_at_budget"] == 50
+
+
+def test_switching_stop_type_clears_previous_value(client_factory, free_user) -> None:
+    """The critical exclusivity check: set replies=3, then switch to budget=50.
+    stop_at_replies must be nulled out server-side."""
+    client = client_factory(free_user)
+    client.patch(
+        "/api/v1/preferences",
+        json={"autopilot_stop_type": "replies", "autopilot_stop_at_replies": 3},
+    )
+    r = client.patch(
+        "/api/v1/preferences",
+        json={"autopilot_stop_type": "budget", "autopilot_stop_at_budget": 50},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["autopilot_stop_type"] == "budget"
+    assert body["autopilot_stop_at_budget"] == 50
+    assert body["autopilot_stop_at_replies"] is None
+    assert body["autopilot_stop_at_date"] is None
+
+
+def test_switching_to_none_clears_all_value_columns(client_factory, free_user) -> None:
+    client = client_factory(free_user)
+    client.patch(
+        "/api/v1/preferences",
+        json={"autopilot_stop_type": "budget", "autopilot_stop_at_budget": 100},
+    )
+    r = client.patch("/api/v1/preferences", json={"autopilot_stop_type": "none"})
+    body = r.json()
+    assert body["autopilot_stop_type"] == "none"
+    assert body["autopilot_stop_at_replies"] is None
+    assert body["autopilot_stop_at_date"] is None
+    assert body["autopilot_stop_at_budget"] is None
+
+
+def test_patch_invalid_stop_type_rejected(client_factory, free_user) -> None:
+    client = client_factory(free_user)
+    r = client.patch("/api/v1/preferences", json={"autopilot_stop_type": "bogus"})
+    assert r.status_code == 422
+
+
+def test_patch_invalid_replies_value_rejected(client_factory, free_user) -> None:
+    """Only 1, 3, 5 are legal reply thresholds."""
+    client = client_factory(free_user)
+    r = client.patch("/api/v1/preferences", json={"autopilot_stop_at_replies": 2})
+    assert r.status_code == 422
+
+
+def test_patch_invalid_budget_value_rejected(client_factory, free_user) -> None:
+    """Only 25, 50, 100, 200 are legal budgets."""
+    client = client_factory(free_user)
+    r = client.patch("/api/v1/preferences", json={"autopilot_stop_at_budget": 42})
+    assert r.status_code == 422
+
+
+def test_patch_past_end_date_rejected(client_factory, free_user) -> None:
+    yesterday = (utcnow().date() - timedelta(days=1)).isoformat()
+    client = client_factory(free_user)
+    r = client.patch("/api/v1/preferences", json={"autopilot_stop_at_date": yesterday})
+    assert r.status_code == 422
+
+
+def test_patch_end_date_beyond_90_days_rejected(client_factory, free_user) -> None:
+    far = (utcnow().date() + timedelta(days=100)).isoformat()
+    client = client_factory(free_user)
+    r = client.patch("/api/v1/preferences", json={"autopilot_stop_at_date": far})
+    assert r.status_code == 422
